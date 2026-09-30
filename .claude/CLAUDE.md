@@ -15,7 +15,7 @@ Build a real-time quick-commerce dispatch system that continuously matches each 
 6. Performance Analytics — average delivery time, on-time rate, rider utilization, zone density, delayed/failed deliveries.
 
 ## Preferred stack
-React + Vite + TypeScript; MapLibre + deck.gl; FastAPI; WebSockets; Google OR-Tools; PostgreSQL; Recharts/ECharts.
+React + Vite + TypeScript; MapLibre + deck.gl; FastAPI; WebSockets; Google OR-Tools; PostgreSQL via Supabase; Recharts/ECharts.
 
 ## Build order
 First make this complete slice work:
