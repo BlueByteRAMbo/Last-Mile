@@ -33,7 +33,9 @@ SEED = 42
 # scenario knobs, toggled by /disruptions endpoints
 state = {
     "dispatch_mode": "optimized",
-    "order_spawn_rate": 0.35,  # probability per tick of a new order
+    "order_spawn_rate": 0.12,  # probability per tick of a new order — was 0.35, which produced far
+    # more demand per minute than a 15-rider fleet can clear (confirmed live: 152 orders stuck in
+    # "created" with every rider saturated near capacity), compounded by the sub_ticks bug above
     "blocked_store_ids": set(),
     "tick_speed_multiplier": 1,  # 1, 10, 20, or 50 — compresses simulation time each tick
 }
@@ -131,7 +133,7 @@ def try_allocate(order, active_orders):
     world.log_event(order.id, "ASSIGNED", {"store_id": store_id, "rider_id": rider_id, "cost": chosen["cost"]})
 
 
-def advance_packing(active_orders):
+def advance_packing(active_orders, speed_mult=1):
     by_store_packing = _group_by(active_orders, ["packing"], "store_id")
     by_store_assigned = _group_by(active_orders, ["assigned"], "store_id")
     risk_rank = {"SEVERE": 0, "DELAYED": 1, "AT_RISK": 2, "LOW": 3}
@@ -140,7 +142,7 @@ def advance_packing(active_orders):
     for store in world.stores:
         packing_now = by_store_packing.get(store.id, [])
         for o in packing_now:
-            elapsed = (now - o.assigned_at).total_seconds()
+            elapsed = (now - o.assigned_at).total_seconds() * speed_mult  # speed_mult compresses sim time, same as rider movement
             if elapsed >= store.packing_seconds_per_order:
                 o.status = "packed"
                 o.packed_at = now
@@ -341,27 +343,38 @@ def build_snapshot() -> dict:
 
 def tick_sync():
     """Pure in-memory tick — no awaits, no DB, nothing network-bound. Called from the async tick()
-    wrapper below so it stays easy to call directly (and time) from tests."""
+    wrapper below so it stays easy to call directly (and time) from tests.
+
+    ponytail-fixed bug: this used to loop `speed_mult` times per real tick ("sub_ticks"), calling
+    move_riders() each time — but move_riders() ALREADY multiplies its per-tick step distance by
+    speed_mult internally, so riders were moving speed_mult^2 as fast (1600x at 40x!), which both
+    broke the visible rider path (huge jumps instead of smooth travel) and meant demand (spawned
+    once per sub-tick, so speed_mult times per real tick) could never keep pace with how fast
+    capacity was freeing up in some runs and wildly outpaced it in others — an unstable feedback
+    loop, not a deliberate design. advance_packing() was *also* called speed_mult times per tick
+    for zero benefit, since it compares against wall-clock `datetime.now()` which barely moves
+    across a handful of back-to-back calls — looping it didn't make packing faster at all, it was
+    dead weight. Fixed: every mechanic below runs exactly once per real tick; speed_mult is applied
+    exactly once, at the one place each mechanic actually needs it (movement distance, packing
+    elapsed-time, spawn probability) — not via unrelated outer-loop repetition."""
     global _tick_count
     from .analytics import record_rider_time
     speed_mult = state["tick_speed_multiplier"]
-    # At higher speeds we run multiple virtual sub-ticks per real-time tick so spawn/packing also
-    # advances proportionally, not just movement.
-    sub_ticks = max(1, speed_mult)
-    record_rider_time(TICK_SECONDS * sub_ticks)
-    for _ in range(sub_ticks):
-        if _rng.random() < state["order_spawn_rate"]:
-            spawn_order()
-        active_orders = world.active_orders()
-        for o in [o for o in active_orders if o.status == "created"]:
-            try_allocate(o, active_orders)
-        advance_packing(active_orders)
-        move_riders(active_orders)
-        recompute_risk(active_orders)
-        fail_overdue_orders(active_orders)
-        _tick_count += 1
-        if state["dispatch_mode"] == "optimized" and _tick_count % REOPTIMIZE_EVERY_N_TICKS == 0:
-            reoptimize_routes(world.active_orders())
+    record_rider_time(TICK_SECONDS * speed_mult)
+
+    effective_spawn_rate = min(0.95, state["order_spawn_rate"] * speed_mult)
+    if _rng.random() < effective_spawn_rate:
+        spawn_order()
+    active_orders = world.active_orders()
+    for o in [o for o in active_orders if o.status == "created"]:
+        try_allocate(o, active_orders)
+    advance_packing(active_orders, speed_mult)
+    move_riders(active_orders)
+    recompute_risk(active_orders)
+    fail_overdue_orders(active_orders)
+    _tick_count += 1
+    if state["dispatch_mode"] == "optimized" and _tick_count % REOPTIMIZE_EVERY_N_TICKS == 0:
+        reoptimize_routes(world.active_orders())
 
 
 async def tick():

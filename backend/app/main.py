@@ -594,7 +594,7 @@ async def reset():
             await session.execute(delete(InventoryItem))
             await session.execute(delete(DarkStore))
             await session.commit()
-        simulator.state.update({"order_spawn_rate": 0.35, "blocked_store_ids": set(), "dispatch_mode": "optimized"})
+        simulator.state.update({"order_spawn_rate": 0.12, "blocked_store_ids": set(), "dispatch_mode": "optimized", "tick_speed_multiplier": 1})
         simulator.reset_rng()
         clear_traffic_zones()
         await seed_db_if_empty()
