@@ -14,10 +14,11 @@ from .seed_data import build_seed_entities
 from .dispatch import (
     score_candidates_sync, cheapest_insertion_cost, travel_seconds,
     add_traffic_zone, clear_traffic_zones, riders_affected_by_zone_sync,
-    rolling_reoptimize_sync, active_traffic_zones,
+    rolling_reoptimize_sync, active_traffic_zones, estimate_zone_adjusted_duration,
 )
 from . import simulator
 from . import world as world_module
+from . import routing
 from .catalog import CATALOG, CATALOG_BY_SKU
 from .world import world
 from .ws import manager
@@ -119,6 +120,15 @@ async def track_order(order_id: str):
 @app.get("/traffic_zones")
 async def traffic_zones():
     return [{"id": z["id"], "lat": z["lat"], "lng": z["lng"], "radius_km": z["radius_km"]} for z in active_traffic_zones()]
+
+
+@app.get("/debug/routing")
+async def debug_routing():
+    """Not part of the product surface — just visibility into whether real Mapbox routes are
+    actually landing in the cache vs. everything silently staying on the haversine fallback."""
+    real = sum(1 for r in routing._route_cache.values() if not r.get("approximate"))
+    return {"cache_size": len(routing._route_cache), "real_routes": real, "in_flight": len(routing._in_flight),
+            "token_configured": bool(routing.MAPBOX_TOKEN)}
 
 
 @app.get("/catalog")
@@ -295,6 +305,23 @@ async def explain_order(order_id: str):
             active_by_rider.setdefault(o.rider_id, []).append(o)
     candidates = score_candidates_sync(order, world.stores, world.riders, active_by_rider, world.inventory)
 
+    # Nearest-feasible-store ranking, independent of which rider ends up assigned — "why this store"
+    # as its own question from "why this rider", per the explain spec.
+    from .dispatch import check_stock, haversine_km
+    store_ranking = []
+    for store in world.stores:
+        has_stock = check_stock(world.inventory, store.id, order.items)
+        store_ranking.append({
+            "store_id": store.id, "store_name": store.name, "has_all_items": has_stock,
+            "distance_km": round(haversine_km(order.customer_lat, order.customer_lng, store.lat, store.lng), 2),
+            "eta_seconds": round(travel_seconds(store.lat, store.lng, order.customer_lat, order.customer_lng, 28.0), 0),
+        })
+    store_ranking.sort(key=lambda s: (not s["has_all_items"], s["distance_km"]))
+
+    chosen_vs_runner_up = None
+    if decision.get("chosen") and decision.get("alternatives"):
+        chosen_vs_runner_up = round(decision["alternatives"][0]["cost"] - decision["chosen"]["cost"], 2)
+
     events = []
     async with SessionLocal() as session:
         rows = (await session.execute(select(OrderEvent).where(OrderEvent.order_id == order_id).order_by(OrderEvent.ts))).scalars().all()
@@ -305,6 +332,8 @@ async def explain_order(order_id: str):
         "status": order.status,
         "risk": order.risk,
         "decision": decision,
+        "chosen_vs_runner_up_cost_delta": chosen_vs_runner_up,
+        "store_ranking": store_ranking,
         "current_candidates": candidates[:6],
         "events": events,
     }
@@ -346,10 +375,48 @@ async def kpis():
     }
 
 
+REROUTE_GAIN_THRESHOLD_SECONDS = 45.0
+REROUTE_GAIN_THRESHOLD_PCT = 0.10
+
+
+async def evaluate_reroute(rider, zone) -> dict:
+    """Does switching the rider's current leg to an alternative road path save enough to be worth
+    it, given this zone? Fetches real Mapbox alternatives from the rider's LIVE position (not the
+    original nav_origin — rerouting happens from where you are now) to the same target. Switches
+    the cached route in place only if the gain clears the threshold; otherwise explicitly reports
+    "kept current route" so that outcome is just as visible as a switch."""
+    current_route = routing.get_cached_route(rider.nav_origin_lat, rider.nav_origin_lng, rider.nav_target_lat, rider.nav_target_lng)
+    current_polyline = current_route["polyline"] if current_route else [
+        [rider.nav_origin_lng, rider.nav_origin_lat], [rider.nav_target_lng, rider.nav_target_lat]]
+    current_duration = estimate_zone_adjusted_duration(current_polyline, rider.speed_kmh, zone)
+
+    alternatives = await routing.fetch_alternatives(rider.lat, rider.lng, rider.nav_target_lat, rider.nav_target_lng)
+    scored = [(estimate_zone_adjusted_duration(r["polyline"], rider.speed_kmh, zone), r) for r in alternatives]
+    best_duration, best_route = min(scored, key=lambda x: x[0])
+
+    gain = current_duration - best_duration
+    threshold = max(REROUTE_GAIN_THRESHOLD_SECONDS, REROUTE_GAIN_THRESHOLD_PCT * current_duration)
+    if gain >= threshold:
+        new_key = routing._key(rider.lat, rider.lng, rider.nav_target_lat, rider.nav_target_lng)
+        routing._store(new_key, best_route)
+        rider.nav_origin_lat, rider.nav_origin_lng = rider.lat, rider.lng  # new leg starts from here, not the old origin
+        rider.route_progress_km = 0.0
+        world.mark_rider_dirty(rider.id)
+        return {"switched": True, "gain_seconds": round(gain, 1),
+                "old_eta_seconds": round(current_duration, 1), "new_eta_seconds": round(best_duration, 1)}
+    return {"switched": False, "gain_seconds": round(gain, 1), "reason": "kept current route — gain below threshold"}
+
+
 @app.post("/disruptions/{kind}")
-async def trigger_disruption(kind: str, target: str | None = None):
+async def trigger_disruption(
+    kind: str, target: str | None = None,
+    lat: float | None = None, lng: float | None = None,
+    radius_km: float = 2.5, multiplier: float = 0.35, duration_minutes: int = 6,
+):
     if kind == "traffic":
-        if len(world.stores) >= 2:
+        if lat is not None and lng is not None:
+            zone_lat, zone_lng = lat, lng  # UI click-to-place
+        elif len(world.stores) >= 2:
             import random
             a, b = random.sample(world.stores, 2)
             zone_lat, zone_lng = (a.lat + b.lat) / 2, (a.lng + b.lng) / 2
@@ -357,16 +424,37 @@ async def trigger_disruption(kind: str, target: str | None = None):
             zone_lat, zone_lng = world.stores[0].lat, world.stores[0].lng
         else:
             zone_lat, zone_lng = 19.07, 72.87
-        zone = add_traffic_zone(zone_lat, zone_lng, radius_km=2.5, multiplier=0.35, duration_minutes=6)
+        zone = add_traffic_zone(zone_lat, zone_lng, radius_km=radius_km, multiplier=multiplier, duration_minutes=duration_minutes)
         affected_riders = riders_affected_by_zone_sync(zone, world.riders, world.active_orders())
+        decisions = {}
         for rid in affected_riders:
             rider = world.rider_by_id[rid]
             pending = sorted([o for o in world.active_orders() if o.rider_id == rid], key=lambda o: o.route_seq or 0)
-            rolling_reoptimize_sync(rider, pending)
-            for o in pending:
-                world.mark_order_dirty(o.id)
-                world.log_event(o.id, "ROUTE_CHANGED", {"reason": "traffic_zone", "zone_id": zone["id"]})
-        return {"ok": True, "kind": kind, "zone": {k: v for k, v in zone.items() if k != "expires_at"}, "affected_riders": affected_riders}
+            decision = rolling_reoptimize_sync(rider, pending)
+            decisions[rid] = {"sequence": decision}
+            if decision and decision["applied"]:
+                for o in pending:
+                    world.mark_order_dirty(o.id)
+                if pending:
+                    world.log_event(pending[0].id, "ROUTE_CHANGED", {
+                        "rider_id": rid, "reason": f"traffic_zone: {decision['reason']}", "zone_id": zone["id"],
+                        "gain_seconds": decision["gain_seconds"],
+                    })
+
+            # route-level reroute: is there a better road path around THIS zone for the rider's
+            # immediate leg? Only switch if it clears the threshold; otherwise explicitly keep the
+            # current path and say so — both outcomes are logged, not just the "switched" one.
+            if rider.nav_target_lat is not None:
+                route_decision = await evaluate_reroute(rider, zone)
+                decisions[rid]["route"] = route_decision
+                if pending:
+                    world.log_event(pending[0].id, "ROUTE_CHANGED" if route_decision["switched"] else "ROUTE_KEPT", {
+                        "rider_id": rid, "zone_id": zone["id"], **route_decision,
+                    })
+        return {
+            "ok": True, "kind": kind, "zone": {k: v for k, v in zone.items() if k != "expires_at"},
+            "affected_riders": affected_riders, "reroute_decisions": decisions,
+        }
     elif kind == "clear_traffic":
         clear_traffic_zones()
     elif kind == "surge":
@@ -384,6 +472,19 @@ async def trigger_disruption(kind: str, target: str | None = None):
             if sid == target:
                 row.qty = row.reserved_qty
                 world.mark_inventory_dirty((sid, row.sku))
+        # pre-pickup orders already assigned to this store can't actually be packed anymore —
+        # bounce them back to the pool so the next tick reallocates them to a store that still
+        # has stock, instead of leaving them stuck waiting on a store that will never pack them
+        for o in world.orders.values():
+            if o.store_id == target and o.status in ("assigned", "packing"):
+                if o.rider_id:
+                    rider = world.rider_by_id.get(o.rider_id)
+                    if rider:
+                        rider.current_load_kg = max(0.0, rider.current_load_kg - o.weight_kg)
+                        world.mark_rider_dirty(rider.id)
+                o.status, o.store_id, o.rider_id, o.route_seq, o.assigned_at, o.packed_at = "created", None, None, None, None, None
+                world.mark_order_dirty(o.id)
+                world.log_event(o.id, "STOCK_OUT_REALLOCATE", {"store_id": target})
     elif kind == "cancel" and target:
         order = world.orders.get(target)
         if order and world.cancel_order(order):

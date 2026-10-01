@@ -25,7 +25,8 @@ ACTIVE_STATUSES = ["assigned", "packing", "packed", "out_for_delivery"]
 ORDER_MUTABLE_COLUMNS = ["status", "risk", "store_id", "rider_id", "route_seq",
                           "assigned_at", "packed_at", "picked_up_at", "delivered_at",
                           "assignment_reason", "failed_reason"]
-RIDER_MUTABLE_COLUMNS = ["lat", "lng", "status", "current_load_kg", "battery_pct"]
+RIDER_MUTABLE_COLUMNS = ["lat", "lng", "status", "current_load_kg", "battery_pct",
+                          "nav_origin_lat", "nav_origin_lng", "nav_target_lat", "nav_target_lng", "route_progress_km"]
 INVENTORY_MUTABLE_COLUMNS = ["qty", "reserved_qty"]
 
 

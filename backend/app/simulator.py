@@ -19,8 +19,9 @@ from .world import world, NON_TERMINAL_STATUSES, ACTIVE_STATUSES
 from .catalog import CATALOG
 from .dispatch import (
     allocate_sync, cheapest_insertion_cost, rolling_reoptimize_sync,
-    traffic_multiplier_for_leg, active_traffic_zones,
+    traffic_multiplier_for_leg, active_traffic_zones, haversine_km,
 )
+from . import routing
 from .ws import manager
 
 TICK_SECONDS = 2.0
@@ -96,8 +97,9 @@ def spawn_order():
 def try_allocate(order, active_orders):
     active_by_rider = _group_by(active_orders, ACTIVE_STATUSES, "rider_id")
     decision = allocate_sync(order, world.stores, world.riders, active_by_rider, world.inventory)
-    if decision is None:
+    if decision["chosen"] is None:
         order.risk = "AT_RISK"
+        order.assignment_reason = json.dumps(decision, default=str)  # keeps the split-fulfilment suggestion visible via /explain
         world.mark_order_dirty(order.id)
         world.log_event(order.id, "DELAY_RISK", {"reason": "no_feasible_store_or_rider"})
         return
@@ -153,6 +155,22 @@ def advance_packing(active_orders):
 
 BATTERY_DRAIN_PCT_PER_KM = 0.4
 
+# legs discovered this tick that need a real route fetched — tick_sync() is pure sync so it can't
+# await routing.ensure_route() itself; it appends here and the async tick() wrapper fires them as
+# background tasks after tick_sync() returns.
+_pending_route_fetches: list[tuple] = []
+
+
+def _leg_polyline_and_length(rider):
+    """The real cached road polyline for the rider's current nav leg if we have one, else a
+    straight-line fallback between the same two points — same two-point shape either way so the
+    caller doesn't need to care which it got."""
+    cached = routing.get_cached_route(rider.nav_origin_lat, rider.nav_origin_lng, rider.nav_target_lat, rider.nav_target_lng)
+    if cached:
+        return cached["polyline"], routing.polyline_total_km(cached["polyline"])
+    polyline = [[rider.nav_origin_lng, rider.nav_origin_lat], [rider.nav_target_lng, rider.nav_target_lat]]
+    return polyline, haversine_km(rider.nav_origin_lat, rider.nav_origin_lng, rider.nav_target_lat, rider.nav_target_lng)
+
 
 def move_riders(active_orders):
     by_rider = _group_by(active_orders, ["packed", "out_for_delivery"], "rider_id")
@@ -165,6 +183,7 @@ def move_riders(active_orders):
         if not active:
             if rider.status == "ON_DELIVERY":
                 rider.status = "AVAILABLE"
+                rider.nav_target_lat = rider.nav_target_lng = None
                 world.mark_rider_dirty(rider.id)
             continue
 
@@ -176,12 +195,32 @@ def move_riders(active_orders):
         else:
             dest_lat, dest_lng = target_order.customer_lat, target_order.customer_lng
 
-        speed = rider.speed_kmh * traffic_multiplier_for_leg(rider.lat, rider.lng, dest_lat, dest_lng)
-        dist_km = ((rider.lat - dest_lat) ** 2 + (rider.lng - dest_lng) ** 2) ** 0.5 * 111.0
-        step_km = speed * (TICK_SECONDS / 3600.0)
-        if dist_km <= step_km:
-            rider.lat, rider.lng = dest_lat, dest_lng
-            moved_km = dist_km
+        # new leg (destination changed, e.g. just picked up, or got reassigned/resequenced)?
+        # reset nav state against the rider's current position and kick off a real-route fetch.
+        if rider.nav_target_lat != dest_lat or rider.nav_target_lng != dest_lng:
+            rider.nav_origin_lat, rider.nav_origin_lng = rider.lat, rider.lng
+            rider.nav_target_lat, rider.nav_target_lng = dest_lat, dest_lng
+            rider.route_progress_km = 0.0
+            _pending_route_fetches.append((rider.nav_origin_lat, rider.nav_origin_lng, dest_lat, dest_lng))
+
+        polyline, total_km = _leg_polyline_and_length(rider)
+        base_step_km = rider.speed_kmh * (TICK_SECONDS / 3600.0)
+
+        # segment-level traffic: check the multiplier against the actual small stretch of road this
+        # tick is about to cross, not the whole remaining leg — a zone only slows the part of the
+        # route that's actually inside it.
+        lookahead_km = min(total_km, rider.route_progress_km + base_step_km)
+        lookahead_lat, lookahead_lng = routing.polyline_progress_point(polyline, lookahead_km)
+        mult = traffic_multiplier_for_leg(rider.lat, rider.lng, lookahead_lat, lookahead_lng)
+        step_km = base_step_km * mult
+
+        new_progress = min(total_km, rider.route_progress_km + step_km)
+        new_lat, new_lng = routing.polyline_progress_point(polyline, new_progress)
+        moved_km = haversine_km(rider.lat, rider.lng, new_lat, new_lng)
+        rider.lat, rider.lng = new_lat, new_lng
+        rider.route_progress_km = new_progress
+
+        if new_progress >= total_km - 1e-6:
             if target_order.status == "packed":
                 target_order.status = "out_for_delivery"
                 target_order.picked_up_at = now
@@ -193,11 +232,8 @@ def move_riders(active_orders):
                 rider.current_load_kg = max(0.0, rider.current_load_kg - target_order.weight_kg)
                 world.mark_order_dirty(target_order.id)
                 world.log_event(target_order.id, "DELIVERED")
-        else:
-            frac = step_km / dist_km
-            moved_km = step_km
-            rider.lat += (dest_lat - rider.lat) * frac
-            rider.lng += (dest_lng - rider.lng) * frac
+            rider.nav_target_lat = rider.nav_target_lng = None  # force a fresh leg next tick
+
         rider.status = "ON_DELIVERY"
         rider.battery_pct = max(0, rider.battery_pct - moved_km * BATTERY_DRAIN_PCT_PER_KM)
         world.mark_rider_dirty(rider.id)
@@ -238,13 +274,26 @@ def fail_overdue_orders(active_orders):
             world.log_event(o.id, "FAILED", {"reason": "no_feasible_rider_or_store_in_time"})
 
 
+REOPTIMIZE_EVERY_N_TICKS = 3  # ~6s at TICK_SECONDS=2 — inside the spec'd 5-10s rolling-reopt window
+_tick_count = 0
+
+
 def reoptimize_routes(active_orders):
     by_rider = _group_by(active_orders, ACTIVE_STATUSES, "rider_id")
     for rider in world.riders:
         pending = sorted(by_rider.get(rider.id, []), key=lambda o: o.route_seq or 0)
-        rolling_reoptimize_sync(rider, pending)
-        for o in pending:
-            world.mark_order_dirty(o.id)  # route_seq may have changed
+        decision = rolling_reoptimize_sync(rider, pending)
+        if decision and decision["applied"]:
+            for o in pending:
+                world.mark_order_dirty(o.id)  # route_seq changed for the whole sequence
+            # attribute the change to whichever order moved to the front — the one the rider is
+            # now heading toward differently — so the event shows up on something visible in the UI
+            if pending:
+                world.log_event(pending[0].id, "ROUTE_CHANGED", {
+                    "rider_id": rider.id, "reason": decision["reason"],
+                    "gain_seconds": decision["gain_seconds"],
+                    "old_eta_seconds": decision["old_eta_seconds"], "new_eta_seconds": decision["new_eta_seconds"],
+                })
 
 
 def build_snapshot() -> dict:
@@ -275,6 +324,7 @@ def build_snapshot() -> dict:
 def tick_sync():
     """Pure in-memory tick — no awaits, no DB, nothing network-bound. Called from the async tick()
     wrapper below so it stays easy to call directly (and time) from tests."""
+    global _tick_count
     if _rng.random() < state["order_spawn_rate"]:
         spawn_order()
 
@@ -286,11 +336,18 @@ def tick_sync():
     move_riders(active_orders)
     recompute_risk(active_orders)
     fail_overdue_orders(active_orders)
-    reoptimize_routes(active_orders)
+
+    _tick_count += 1
+    if _tick_count % REOPTIMIZE_EVERY_N_TICKS == 0:
+        reoptimize_routes(world.active_orders())  # re-fetch: packing/delivery above may have changed who's pending
 
 
 async def tick():
     tick_sync()
+    if _pending_route_fetches:
+        legs, _pending_route_fetches[:] = list(_pending_route_fetches), []
+        for leg in legs:
+            asyncio.create_task(routing.ensure_route(*leg))  # fire-and-forget; tick never awaits network I/O
     await manager.broadcast(build_snapshot())
 
 

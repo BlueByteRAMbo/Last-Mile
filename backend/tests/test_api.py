@@ -193,6 +193,66 @@ async def test_cancel_disruption_releases_reserved_stock_via_http(client):
     assert world.inventory[(store_id, "SKU-MILK")].reserved_qty == 0
 
 
+async def test_evaluate_reroute_switches_when_alternative_avoids_the_zone(client, monkeypatch):
+    from app import routing
+    from app.main import evaluate_reroute
+    from app.dispatch import add_traffic_zone, clear_traffic_zones
+
+    clear_traffic_zones()
+    riders = (await client.get("/riders")).json()
+    rider_id = riders[0]["id"]
+    rider = world.rider_by_id[rider_id]
+    rider.lat, rider.lng = 19.00, 72.80
+    rider.nav_origin_lat, rider.nav_origin_lng = 19.00, 72.80
+    rider.nav_target_lat, rider.nav_target_lng = 19.00, 72.90  # due east
+
+    # zone sits directly on the straight-line path, heavily slowing it
+    zone = add_traffic_zone(19.00, 72.85, radius_km=3.0, multiplier=0.1, duration_minutes=10)
+    # the cached "current" route is the straight line through the zone
+    routing._store(routing._key(19.00, 72.80, 19.00, 72.90), {
+        "polyline": [[72.80, 19.00], [72.90, 19.00]], "distance_m": 11000, "duration_s": 1000, "approximate": False,
+    })
+
+    async def fake_alternatives(lat1, lng1, lat2, lng2):
+        # detours well north of the zone (radius 3km ~ 0.027 deg) — clear of it entirely
+        return [{"polyline": [[lng1, lat1], [72.85, 19.10], [lng2, lat2]], "distance_m": 15000, "duration_s": 1800, "approximate": False}]
+    monkeypatch.setattr(routing, "fetch_alternatives", fake_alternatives)
+
+    decision = await evaluate_reroute(rider, zone)
+    assert decision["switched"] is True
+    assert decision["gain_seconds"] > 0
+    clear_traffic_zones()
+
+
+async def test_evaluate_reroute_keeps_current_route_when_alternative_is_worse(client, monkeypatch):
+    from app import routing
+    from app.main import evaluate_reroute
+    from app.dispatch import add_traffic_zone, clear_traffic_zones
+
+    clear_traffic_zones()
+    riders = (await client.get("/riders")).json()
+    rider_id = riders[0]["id"]
+    rider = world.rider_by_id[rider_id]
+    rider.lat, rider.lng = 19.00, 72.80
+    rider.nav_origin_lat, rider.nav_origin_lng = 19.00, 72.80
+    rider.nav_target_lat, rider.nav_target_lng = 19.00, 72.81  # a short hop, not even near the zone
+
+    zone = add_traffic_zone(20.00, 73.50, radius_km=1.0, multiplier=0.1, duration_minutes=10)  # nowhere near this leg
+    routing._store(routing._key(19.00, 72.80, 19.00, 72.81), {
+        "polyline": [[72.80, 19.00], [72.81, 19.00]], "distance_m": 1000, "duration_s": 100, "approximate": False,
+    })
+
+    async def fake_alternatives(lat1, lng1, lat2, lng2):
+        # a longer, slower detour with nothing to gain since the zone doesn't even touch this leg
+        return [{"polyline": [[lng1, lat1], [72.85, 19.10], [lng2, lat2]], "distance_m": 20000, "duration_s": 3000, "approximate": False}]
+    monkeypatch.setattr(routing, "fetch_alternatives", fake_alternatives)
+
+    decision = await evaluate_reroute(rider, zone)
+    assert decision["switched"] is False
+    assert "kept current route" in decision["reason"]
+    clear_traffic_zones()
+
+
 async def test_traffic_disruption_creates_a_zone(client):
     r = await client.post("/disruptions/traffic")
     body = r.json()
@@ -206,6 +266,31 @@ async def test_traffic_disruption_creates_a_zone(client):
     assert clear.json()["ok"] is True
     zones_after = (await client.get("/traffic_zones")).json()
     assert zones_after == []
+
+
+async def test_stockout_bounces_pre_pickup_orders_back_to_the_pool(client):
+    stores = (await client.get("/dark_stores")).json()
+    riders = (await client.get("/riders")).json()
+    store_id, rider_id = stores[0]["id"], riders[0]["id"]
+    rider = world.rider_by_id[rider_id]
+    rider.current_load_kg = 2.0
+
+    order = Order(
+        id="ORD-STOCKOUT-TEST", customer_lat=19.05, customer_lng=72.84,
+        items=[{"sku": "SKU-MILK", "name": "Milk 1L", "qty": 1, "weight_kg": 0.5}],
+        weight_kg=0.5, priority=False, created_at=dt.datetime.now(dt.timezone.utc),
+        promised_at=dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=20),
+        status="packing", store_id=store_id, rider_id=rider_id,
+    )
+    world.orders[order.id] = order
+
+    r = await client.post(f"/disruptions/stockout?target={store_id}")
+    assert r.json()["ok"] is True
+
+    assert order.status == "created"
+    assert order.store_id is None
+    assert order.rider_id is None
+    assert rider.current_load_kg == pytest.approx(1.5)  # released the 0.5kg this order was carrying
 
 
 async def test_reset_reseeds_clean_state(client):
