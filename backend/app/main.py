@@ -3,6 +3,7 @@ import datetime as dt
 import json
 import uuid
 from contextlib import asynccontextmanager
+from typing import Literal
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -21,6 +22,7 @@ from . import world as world_module
 from . import routing
 from .catalog import CATALOG, CATALOG_BY_SKU
 from .world import world
+from .tracking import delivery_etas, order_tracking, rider_route as tracking_rider_route
 from .ws import manager
 
 _background_tasks: list[asyncio.Task] = []
@@ -55,6 +57,30 @@ app = FastAPI(title="Last Mile Mission Control", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
+class DispatchMode(BaseModel):
+    mode: Literal['nearest', 'optimized']
+
+
+@app.get('/dispatch/mode')
+async def dispatch_mode():
+    return {'mode': simulator.state['dispatch_mode']}
+
+
+@app.post('/dispatch/mode')
+async def set_dispatch_mode(body: DispatchMode):
+    simulator.state['dispatch_mode'] = body.mode
+    return {'mode': body.mode}
+
+
+@app.get('/analytics/comparison')
+async def dispatch_comparison():
+    from .comparison import comparison
+    try:
+        return await comparison()
+    except (RuntimeError, asyncio.TimeoutError):
+        raise HTTPException(503, 'Comparison could not finish; please retry')
+
+
 @app.get("/dark_stores")
 async def list_dark_stores():
     out = []
@@ -84,13 +110,11 @@ async def track_order(order_id: str):
         raise HTTPException(404, "order not found")
 
     rider_pos = None
-    eta_seconds = None
     rider_name = None
     if order.rider_id:
         rider = world.rider_by_id.get(order.rider_id)
         if rider:
             rider_pos = {"lat": rider.lat, "lng": rider.lng}
-            eta_seconds = round(travel_seconds(rider.lat, rider.lng, order.customer_lat, order.customer_lng, rider.speed_kmh), 1)
             rider_name = rider.name
 
     store_name = world.store_by_id[order.store_id].name if order.store_id in world.store_by_id else None
@@ -112,7 +136,11 @@ async def track_order(order_id: str):
         "delivered_at": order.delivered_at.isoformat() if order.delivered_at else None,
         "rider_position": rider_pos,
         "rider_name": rider_name,
-        "eta_seconds": eta_seconds,
+        **{key: value for key, value in order_tracking(order, delivery_etas(world.active_orders()), dt.datetime.now(dt.timezone.utc)).items()
+           if key != "priority_score"},
+        **(tracking_rider_route(world.rider_by_id[order.rider_id])
+           if order.rider_id in world.rider_by_id and order.status in ("assigned", "packing", "packed", "out_for_delivery")
+           else {"polyline_remaining": [], "route_version": None, "heading": None, "approximate_route": True}),
         "customer_location": {"lat": order.customer_lat, "lng": order.customer_lng},
     }
 
@@ -202,6 +230,8 @@ async def list_riders():
 
 @app.get("/orders")
 async def list_orders(status: str | None = None):
+    now = dt.datetime.now(dt.timezone.utc)
+    etas = delivery_etas(world.active_orders(), now)
     orders = list(world.orders.values())
     if status:
         orders = [o for o in orders if o.status == status]
@@ -212,7 +242,71 @@ async def list_orders(status: str | None = None):
         "items": o.items, "weight_kg": o.weight_kg,
         "customer_name": o.customer_name, "address_label": o.address_label,
         "promised_at": o.promised_at.isoformat(), "created_at": o.created_at.isoformat(),
+        **order_tracking(o, etas, now),
     } for o in orders[:200]]
+
+
+@app.post("/orders/{order_id}/intervene/{action}")
+async def intervene_order(order_id: str, action: str):
+    order = world.orders.get(order_id)
+    if order is None:
+        raise HTTPException(404, "order not found")
+    if action not in ("boost", "reassign", "cancel"):
+        raise HTTPException(400, "unknown intervention")
+    if order.status in ("delivered", "failed", "cancelled"):
+        raise HTTPException(409, "This order is already finished")
+    if action == "boost":
+        if not order.priority:
+            order.priority = True
+            world.mark_order_dirty(order.id)
+            world.log_event(order.id, "PRIORITY_BOOSTED", {"source": "operator"})
+    elif action == "cancel":
+        world.cancel_order(order)
+        world.log_event(order.id, "CANCELLED", {"source": "operator"})
+    else:
+        if order.status not in ("assigned", "packing", "packed"):
+            raise HTTPException(409, "Only orders awaiting pickup can be reassigned")
+        store = world.store_by_id.get(order.store_id)
+        if store is None:
+            raise HTTPException(409, "Assigned store is unavailable")
+        # Keep packing and reserved stock at the same store. Score an alternative
+        # rider against a projection that includes this order's own reservation.
+        from types import SimpleNamespace
+        inventory = dict(world.inventory)
+        for item in order.items:
+            key = (order.store_id, item["sku"])
+            row = inventory.get(key)
+            if row:
+                inventory[key] = SimpleNamespace(qty=row.qty, reserved_qty=max(0, row.reserved_qty - item["qty"]))
+        by_rider = simulator._group_by(world.active_orders(), world_module.ACTIVE_STATUSES, "rider_id")
+        candidates = score_candidates_sync(order, [store],
+            [r for r in world.riders if r.id != order.rider_id], by_rider, inventory)
+        chosen = next((c for c in candidates if c["feasible"]), None)
+        if chosen is None:
+            raise HTTPException(409, "No alternative rider is currently feasible; assignment kept")
+        old_id = order.rider_id
+        old_rider = world.rider_by_id.get(old_id)
+        new_rider = world.rider_by_id[chosen["rider_id"]]
+        pending = by_rider.get(new_rider.id, [])
+        idx, _, feasible = cheapest_insertion_cost(new_rider, pending, order, store)
+        if not feasible:
+            raise HTTPException(409, "Alternative route would break a delivery promise; assignment kept")
+        for other in pending:
+            if (other.route_seq or 0) >= idx:
+                other.route_seq = (other.route_seq or 0) + 1
+                world.mark_order_dirty(other.id)
+        if old_rider:
+            old_rider.current_load_kg = max(0, old_rider.current_load_kg - order.weight_kg)
+            old_rider.nav_target_lat = old_rider.nav_target_lng = None
+            world.mark_rider_dirty(old_id)
+        new_rider.current_load_kg += order.weight_kg
+        new_rider.nav_target_lat = new_rider.nav_target_lng = None
+        order.rider_id, order.route_seq = new_rider.id, idx
+        order.assignment_reason = json.dumps({"chosen": chosen, "alternatives": candidates[1:5], "source": "operator"})
+        world.mark_order_dirty(order.id)
+        world.mark_rider_dirty(new_rider.id)
+        world.log_event(order.id, "REASSIGNED", {"old_rider_id": old_id, "rider_id": new_rider.id, "source": "operator"})
+    return {"ok": True, "id": order.id, "status": order.status, "priority": order.priority, "rider_id": order.rider_id}
 
 
 class OrderItemIn(BaseModel):
@@ -339,40 +433,11 @@ async def explain_order(order_id: str):
     }
 
 
+@app.get("/analytics")
 @app.get("/kpis")
 async def kpis():
-    orders = list(world.orders.values())
-    delivered = [o for o in orders if o.status == "delivered"]
-    failed_count = sum(1 for o in orders if o.status in ("failed", "cancelled"))
-    terminal = len(delivered) + failed_count
-
-    avg_delivery_min = 0.0
-    on_time = 0
-    if delivered:
-        total_min = sum((o.delivered_at - o.created_at).total_seconds() / 60.0 for o in delivered)
-        avg_delivery_min = round(total_min / len(delivered), 1)
-        on_time = sum(1 for o in delivered if o.delivered_at <= o.promised_at)
-
-    riders = [r for r in world.riders if r.status != "OFFLINE"]
-    busy = sum(1 for r in riders if r.status == "ON_DELIVERY")
-    utilization = round(100 * busy / len(riders), 1) if riders else 0.0
-
-    zone_counts: dict[str, int] = {}
-    active = world.active_orders()
-    for o in active:
-        key = f"{round(o.customer_lat, 2)},{round(o.customer_lng, 2)}"
-        zone_counts[key] = zone_counts.get(key, 0) + 1
-
-    return {
-        "avg_delivery_minutes": avg_delivery_min,
-        "on_time_rate_pct": round(100 * on_time / len(delivered), 1) if delivered else 100.0,
-        "rider_utilization_pct": utilization,
-        "sla_breach_rate_pct": round(100 * (len(delivered) - on_time + failed_count) / terminal, 1) if terminal else 0.0,
-        "failed_count": failed_count,
-        "delivered_count": len(delivered),
-        "active_orders": len(active),
-        "zone_density": [{"zone": k, "count": v} for k, v in sorted(zone_counts.items(), key=lambda x: -x[1])[:10]],
-    }
+    from .analytics import build_analytics
+    return build_analytics()
 
 
 REROUTE_GAIN_THRESHOLD_SECONDS = 45.0
@@ -505,7 +570,7 @@ async def reset():
             await session.execute(delete(InventoryItem))
             await session.execute(delete(DarkStore))
             await session.commit()
-        simulator.state.update({"order_spawn_rate": 0.35, "blocked_store_ids": set()})
+        simulator.state.update({"order_spawn_rate": 0.35, "blocked_store_ids": set(), "dispatch_mode": "optimized"})
         simulator.reset_rng()
         clear_traffic_zones()
         await seed_db_if_empty()

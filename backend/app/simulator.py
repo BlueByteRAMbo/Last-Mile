@@ -22,6 +22,7 @@ from .dispatch import (
     traffic_multiplier_for_leg, active_traffic_zones, haversine_km,
 )
 from . import routing
+from .tracking import rider_route, delivery_etas, order_tracking
 from .ws import manager
 
 TICK_SECONDS = 2.0
@@ -30,6 +31,7 @@ SEED = 42
 
 # scenario knobs, toggled by /disruptions endpoints
 state = {
+    "dispatch_mode": "optimized",
     "order_spawn_rate": 0.35,  # probability per tick of a new order
     "blocked_store_ids": set(),
 }
@@ -96,7 +98,7 @@ def spawn_order():
 
 def try_allocate(order, active_orders):
     active_by_rider = _group_by(active_orders, ACTIVE_STATUSES, "rider_id")
-    decision = allocate_sync(order, world.stores, world.riders, active_by_rider, world.inventory)
+    decision = allocate_sync(order, world.stores, world.riders, active_by_rider, world.inventory, state["dispatch_mode"])
     if decision["chosen"] is None:
         order.risk = "AT_RISK"
         order.assignment_reason = json.dumps(decision, default=str)  # keeps the split-fulfilment suggestion visible via /explain
@@ -298,6 +300,10 @@ def reoptimize_routes(active_orders):
 
 def build_snapshot() -> dict:
     visible_orders = [o for o in world.orders.values() if o.status not in ("delivered", "failed", "cancelled")]
+    now = dt.datetime.now(dt.timezone.utc)
+    etas = delivery_etas(visible_orders, now)
+    routes = {r.id: rider_route(r) for r in world.riders}
+    assigned = _group_by(visible_orders, ACTIVE_STATUSES, "rider_id")
     return {
         "type": "tick",
         "dark_stores": [{"id": s.id, "name": s.name, "lat": s.lat, "lng": s.lng} for s in world.stores],
@@ -309,13 +315,16 @@ def build_snapshot() -> dict:
             {"id": r.id, "name": r.name, "lat": r.lat, "lng": r.lng, "status": r.status,
              "current_load_kg": r.current_load_kg, "capacity_kg": r.capacity_kg,
              "utilization": round(100 * r.current_load_kg / r.capacity_kg) if r.capacity_kg else 0,
-             "battery_pct": round(r.battery_pct, 1)}
+             "battery_pct": round(r.battery_pct, 1), **routes[r.id],
+             "assigned_order_ids": [o.id for o in sorted(assigned.get(r.id, []), key=lambda o: (o.route_seq or 0, o.id))]}
             for r in world.riders
         ],
         "orders": [
             {"id": o.id, "lat": o.customer_lat, "lng": o.customer_lng, "status": o.status,
              "priority": o.priority, "risk": o.risk, "rider_id": o.rider_id, "store_id": o.store_id,
-             "promised_at": o.promised_at.isoformat()}
+             "promised_at": o.promised_at.isoformat(), "customer_name": o.customer_name,
+             **order_tracking(o, etas, now),
+             "route_version": routes.get(o.rider_id, {}).get("route_version")}
             for o in visible_orders
         ],
     }
@@ -325,6 +334,8 @@ def tick_sync():
     """Pure in-memory tick — no awaits, no DB, nothing network-bound. Called from the async tick()
     wrapper below so it stays easy to call directly (and time) from tests."""
     global _tick_count
+    from .analytics import record_rider_time
+    record_rider_time(TICK_SECONDS)
     if _rng.random() < state["order_spawn_rate"]:
         spawn_order()
 
@@ -338,7 +349,7 @@ def tick_sync():
     fail_overdue_orders(active_orders)
 
     _tick_count += 1
-    if _tick_count % REOPTIMIZE_EVERY_N_TICKS == 0:
+    if state["dispatch_mode"] == "optimized" and _tick_count % REOPTIMIZE_EVERY_N_TICKS == 0:
         reoptimize_routes(world.active_orders())  # re-fetch: packing/delivery above may have changed who's pending
 
 

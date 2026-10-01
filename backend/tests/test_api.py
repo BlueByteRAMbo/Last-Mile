@@ -15,6 +15,128 @@ from app.models import Order
 pytestmark = pytest.mark.asyncio
 
 
+async def intervention_order(client):
+    response = await client.post('/orders', json={
+        'customer_lat': 19.10, 'customer_lng': 72.85,
+        'items': [{'sku': 'SKU-MILK', 'name': 'Milk', 'qty': 1, 'weight_kg': 0.5}],
+    })
+    return world.orders[response.json()['id']]
+
+
+async def test_priority_boost_is_idempotent_and_persisted(client):
+    order = await intervention_order(client)
+    await world_module.persist_once()
+    for _ in range(2):
+        response = await client.post(f'/orders/{order.id}/intervene/boost')
+        assert response.status_code == 200
+    assert sum(e.type == 'PRIORITY_BOOSTED' for e in world.pending_events) == 1
+    await world_module.persist_once()
+    async with client.session_factory() as session:
+        saved = await session.get(Order, order.id)
+        assert saved.priority is True
+
+
+async def test_reassign_keeps_packing_and_stock_and_changes_only_one_order(client):
+    order = await intervention_order(client)
+    store = world.stores[0]
+    first, second = world.riders[:2]
+    for rider in world.riders:
+        rider.status = 'OFFLINE'
+    for rider in (first, second):
+        rider.status = 'AVAILABLE'
+        rider.lat, rider.lng = store.lat, store.lng
+    order.customer_lat, order.customer_lng = store.lat, store.lng
+    order.status, order.store_id, order.rider_id = 'packing', store.id, first.id
+    order.assigned_at = dt.datetime.now(dt.timezone.utc)
+    first.current_load_kg = order.weight_kg
+    world.inventory[(store.id, 'SKU-MILK')].qty = 10
+    world.reserve_stock(store.id, order.items)
+    reserved = world.inventory[(store.id, 'SKU-MILK')].reserved_qty
+    response = await client.post(f'/orders/{order.id}/intervene/reassign')
+    assert response.status_code == 200, response.text
+    assert order.rider_id == second.id
+    assert order.status == 'packing' and order.store_id == store.id
+    assert first.current_load_kg == 0
+    assert second.current_load_kg == order.weight_kg
+    assert world.inventory[(store.id, 'SKU-MILK')].reserved_qty == reserved
+    assert any(e.type == 'REASSIGNED' for e in world.pending_events)
+
+
+async def test_reassign_without_alternative_preserves_assignment(client):
+    order = await intervention_order(client)
+    order.status, order.store_id, order.rider_id = 'packed', world.stores[0].id, world.riders[0].id
+    for rider in world.riders:
+        rider.status = 'OFFLINE'
+    before = (order.status, order.rider_id, order.store_id)
+    response = await client.post(f'/orders/{order.id}/intervene/reassign')
+    assert response.status_code == 409
+    assert (order.status, order.rider_id, order.store_id) == before
+
+
+async def test_intervention_errors_and_cancel(client):
+    assert (await client.post('/orders/missing/intervene/boost')).status_code == 404
+    order = await intervention_order(client)
+    assert (await client.post(f'/orders/{order.id}/intervene/invalid')).status_code == 400
+    order.status = 'out_for_delivery'
+    assert (await client.post(f'/orders/{order.id}/intervene/reassign')).status_code == 409
+    assert (await client.post(f'/orders/{order.id}/intervene/cancel')).status_code == 200
+    assert order.status == 'cancelled'
+    assert (await client.post(f'/orders/{order.id}/intervene/boost')).status_code == 409
+
+
+async def test_queue_score_in_rest_and_snapshot_but_not_customer_response(client):
+    order = await intervention_order(client)
+    before = (await client.get('/orders')).json()[0]['priority_score']
+    await client.post(f'/orders/{order.id}/intervene/boost')
+    after = (await client.get('/orders')).json()[0]['priority_score']
+    assert after >= before + 5
+    assert 'priority_score' in simulator_module.build_snapshot()['orders'][0]
+    assert 'priority_score' not in (await client.get(f'/track/{order.id}')).json()
+
+
+async def test_analytics_includes_unflushed_events_and_survives_reload(client):
+    from app.analytics import record_rider_time
+    order = await intervention_order(client)
+    rider = world.riders[0]
+    order.status, order.rider_id = 'assigned', rider.id
+    world.log_event(order.id, 'RIDER_OFFLINE', {'rider_id': rider.id})
+    timestamp = world.events[-1].ts
+    record_rider_time(2)
+    before = (await client.get('/analytics')).json()
+    assert next(r for r in before['delay_reasons'] if r['reason'] == 'Rider offline')['count'] == 1
+    assert next(r for r in before['rider_stats'] if r['id'] == rider.id)['busy_seconds'] == 2
+    await world_module.persist_once()
+    await world_module.load_world()
+    after = (await client.get('/analytics')).json()
+    assert after['rider_stats'] == before['rider_stats']
+    assert after['delay_reasons'] == before['delay_reasons']
+    assert world.events[-1].ts.replace(tzinfo=dt.timezone.utc) == timestamp
+    await client.post('/reset')
+    reset = (await client.get('/analytics')).json()
+    assert all(r['count'] == 0 for r in reset['delay_reasons'])
+    assert all(r['observed_shift_seconds'] == 0 for r in reset['rider_stats'])
+
+
+async def test_dispatch_mode_validation_and_reset(client):
+    assert (await client.post('/dispatch/mode', json={'mode': 'nearest'})).json()['mode'] == 'nearest'
+    assert (await client.get('/dispatch/mode')).json()['mode'] == 'nearest'
+    assert (await client.post('/dispatch/mode', json={'mode': 'invalid'})).status_code == 422
+    await client.post('/reset')
+    assert (await client.get('/dispatch/mode')).json()['mode'] == 'optimized'
+
+
+async def test_comparison_endpoint_does_not_touch_live_orders(client, monkeypatch):
+    from app import comparison
+    order = await intervention_order(client)
+    async def replay():
+        return {'seed': 42, 'results': {'nearest': {}, 'optimized': {}}}
+    monkeypatch.setattr(comparison, 'comparison', replay)
+    response = await client.get('/analytics/comparison')
+    assert response.status_code == 200
+    assert response.json()['seed'] == 42
+    assert world.orders[order.id] is order
+
+
 @pytest_asyncio.fixture
 async def client(monkeypatch):
     """Spin up the real FastAPI app against an isolated in-memory DB, with the background

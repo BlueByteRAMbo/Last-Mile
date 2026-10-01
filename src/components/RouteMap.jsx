@@ -26,7 +26,7 @@ function orderColor(o) {
 
 // Real backend state drives every marker: dark stores, riders (from /riders + WS ticks) and
 // orders (with live risk/priority) replace the old static mock data + random-walk animation.
-const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [], simulationMode, onMapLoad }) => {
+const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [], demandZones = [], showDemandHeatmap = false, simulationMode, onMapLoad }) => {
   const mapContainer = useRef(null);
   const map = useRef(null);
   const storeMarkers = useRef([]);
@@ -58,6 +58,33 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
       map.current = null;
     };
   }, []);
+
+  // Aggregate demand by named hub catchment; visible while reviewing analytics.
+  useEffect(() => {
+    const m = map.current;
+    if (!m) return;
+    const update = () => {
+      if (!m.isStyleLoaded()) return;
+      const data = { type: 'FeatureCollection', features: demandZones.filter(z => z.count > 0 && z.lng != null && z.lat != null).map(z => ({
+        type: 'Feature', properties: { count: z.count }, geometry: { type: 'Point', coordinates: [z.lng, z.lat] },
+      })) };
+      if (!m.getSource('demand-density')) m.addSource('demand-density', { type: 'geojson', data });
+      else m.getSource('demand-density').setData(data);
+      if (!m.getLayer('demand-density-heat')) m.addLayer({
+        id: 'demand-density-heat', type: 'heatmap', source: 'demand-density',
+        paint: {
+          'heatmap-weight': ['interpolate', ['linear'], ['get', 'count'], 0, 0, 10, 0.5, 100, 1],
+          'heatmap-radius': 55, 'heatmap-opacity': 0.55,
+          'heatmap-color': ['interpolate', ['linear'], ['heatmap-density'],
+            0, 'rgba(56,189,248,0)', 0.3, '#38BDF8', 0.6, '#FBBF24', 1, '#F87171'],
+        },
+      });
+      m.setLayoutProperty('demand-density-heat', 'visibility', showDemandHeatmap ? 'visible' : 'none');
+    };
+    update();
+    m.on('style.load', update);
+    return () => { m.off('style.load', update); };
+  }, [demandZones, showDemandHeatmap]);
 
   // Live congestion zones from the backend (real disruptions, not static mock data): a circle per zone.
   useEffect(() => {

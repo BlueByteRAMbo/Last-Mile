@@ -70,6 +70,8 @@ const OperationsMap = () => {
         riders={live.riders}
         orders={live.orders}
         trafficZones={live.trafficZones}
+        demandZones={live.kpis?.zone_density || []}
+        showDemandHeatmap={activeTab === 'Analytics'}
       />
 
       {isSimulation && mapInstance && (

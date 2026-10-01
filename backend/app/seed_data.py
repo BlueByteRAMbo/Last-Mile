@@ -19,6 +19,7 @@ STOCK_LEVELS = [0, 0, 3, 8, 40, 80, 150, 200]  # weighted toward well-stocked, w
 
 
 def build_seed_entities():
+    _inv_rng = random.Random(42)
     now = dt.datetime.now(dt.timezone.utc)
     stores = [DarkStore(id=i, name=n, lat=lat, lng=lng, packing_capacity=6, packing_seconds_per_order=75)
               for i, n, lat, lng in STORES]

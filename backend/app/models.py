@@ -41,6 +41,8 @@ class Rider(Base):
     battery_pct: Mapped[float] = mapped_column(Float, default=100.0)
     status: Mapped[str] = mapped_column(String, default="AVAILABLE")  # AVAILABLE/ON_DELIVERY/OFFLINE
     shift_end: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
+    busy_seconds: Mapped[float] = mapped_column(Float, default=0.0)
+    observed_shift_seconds: Mapped[float] = mapped_column(Float, default=0.0)
     # current navigation leg: origin is where this leg started (stable, so the route cache key
     # doesn't change every tick as lat/lng move), target is the destination, progress_km is how
     # far along that leg's polyline the rider has travelled. Reset whenever the target changes.

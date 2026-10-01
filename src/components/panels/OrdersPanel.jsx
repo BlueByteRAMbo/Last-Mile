@@ -63,12 +63,32 @@ const NewOrderForm = ({ onClose, onCreated }) => {
 };
 
 const OrdersPanel = ({ orders, onSelect }) => {
-  const [filter, setFilter] = useState('ALL');
+  const [filter, setFilter] = useState('QUEUE');
   const [showForm, setShowForm] = useState(false);
-  const [refreshKey, setRefreshKey] = useState(0);
+  const [pending, setPending] = useState(null);
+  const [notice, setNotice] = useState('');
+  const [updated, setUpdated] = useState({});
+  useEffect(() => setUpdated({}), [orders]);
+  const intervene = async (order, action) => {
+    setPending(order.id);
+    setNotice('');
+    try {
+      const result = await api.interveneOrder(order.id, action);
+      setUpdated(previous => ({ ...previous, [order.id]: result }));
+      setNotice(`${order.id}: ${action === 'boost' ? 'priority boosted' : action === 'reassign' ? `reassigned to ${result.rider_id}` : 'cancelled'}`);
+    } catch (error) {
+      setNotice(error.message);
+    } finally {
+      setPending(null);
+    }
+  };
 
-  const filtered = filter === 'ALL' ? orders : orders.filter(o => o.status === filter);
-  const statuses = ['ALL', 'created', 'assigned', 'packing', 'packed', 'out_for_delivery', 'delivered', 'cancelled'];
+  const active = o => !['delivered', 'failed', 'cancelled'].includes(o.status);
+  const atRisk = o => active(o) && (o.predicted_late || ['AT_RISK', 'DELAYED', 'SEVERE'].includes(o.risk));
+  const current = orders.map(o => ({ ...o, ...updated[o.id] }));
+  const filtered = current.filter(o => filter === 'QUEUE' ? active(o) : filter === 'AT RISK' ? atRisk(o) : filter === 'ALL' || o.status === filter)
+    .sort((a, b) => (b.priority_score || 0) - (a.priority_score || 0) || a.id.localeCompare(b.id));
+  const statuses = ['QUEUE', 'AT RISK', 'ALL', 'created', 'assigned', 'packing', 'packed', 'out_for_delivery'];
 
   return (
     <div className="absolute top-40 left-6 z-10 pointer-events-auto bg-route-panel/95 backdrop-blur-md rounded-lg border border-white/10 shadow-2xl w-96 max-h-[65vh] flex flex-col">
@@ -79,7 +99,9 @@ const OrdersPanel = ({ orders, onSelect }) => {
         </button>
       </div>
       <div className="p-3 pb-0">
-        {showForm && <NewOrderForm onClose={() => setShowForm(false)} onCreated={() => setRefreshKey(k => k + 1)} />}
+        {showForm && <NewOrderForm onClose={() => setShowForm(false)} onCreated={() => setNotice('Order placed; awaiting live update.')} />}
+        <p className="text-[10px] text-slate-400 mb-2">Priority queue: urgency + express + overdue minutes. {current.filter(atRisk).length} at risk.</p>
+        {notice && <p role="status" className="text-xs text-route-amber mb-2">{notice}</p>}
         <div className="flex gap-1 flex-wrap mb-2">
           {statuses.map(s => (
             <button key={s} onClick={() => setFilter(s)}
@@ -93,7 +115,7 @@ const OrdersPanel = ({ orders, onSelect }) => {
         {filtered.length === 0 && <div className="text-xs text-slate-500 py-4 text-center">No orders</div>}
         {filtered.map(o => (
           <div key={o.id} onClick={() => onSelect({ type: 'ORDER', id: o.id, name: `Order ${o.id}`, data: o })}
-            className="flex justify-between items-center py-2 px-2 rounded hover:bg-white/5 cursor-pointer border-b border-white/5 last:border-0">
+            className="flex flex-wrap justify-between items-center py-2 px-2 rounded hover:bg-white/5 cursor-pointer border-b border-white/5 last:border-0">
             <div className="flex flex-col">
               <span className="text-xs font-medium text-white">{o.id}{o.priority && <span className="text-route-cyan ml-1">★</span>}</span>
               <span className="text-[10px] text-slate-500">{o.status.replace('_', ' ')} · {o.rider_id || 'unassigned'}</span>
@@ -105,6 +127,18 @@ const OrdersPanel = ({ orders, onSelect }) => {
                 track
               </a>
             </div>
+            <div className="w-full text-[10px] text-slate-400 mt-1">
+              {o.customer_name || 'Customer'} · ETA {o.eta_seconds == null ? 'pending' : `${Math.ceil(o.eta_seconds / 60)} min`} · Score {o.priority_score ?? '—'}
+              {o.predicted_late && <span className="text-route-red ml-1">Predicted late</span>}
+            </div>
+            {active(o) && <div className="w-full flex gap-2 mt-2" onClick={e => e.stopPropagation()}>
+              {['boost', 'reassign', 'cancel'].map(action => <button key={action}
+                disabled={pending !== null || (action === 'boost' && o.priority) || (action === 'reassign' && !['assigned', 'packing', 'packed'].includes(o.status))}
+                onClick={() => intervene(o, action)}
+                className="text-[10px] px-2 py-1 rounded border border-white/20 text-slate-300 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed">
+                {action === 'boost' ? 'Boost priority' : action === 'reassign' ? 'Reassign' : 'Cancel'}
+              </button>)}
+            </div>}
           </div>
         ))}
       </div>

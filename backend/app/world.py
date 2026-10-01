@@ -22,10 +22,11 @@ db_write_lock = asyncio.Lock()
 NON_TERMINAL_STATUSES = ["created", "assigned", "packing", "packed", "out_for_delivery"]
 ACTIVE_STATUSES = ["assigned", "packing", "packed", "out_for_delivery"]
 
-ORDER_MUTABLE_COLUMNS = ["status", "risk", "store_id", "rider_id", "route_seq",
+ORDER_MUTABLE_COLUMNS = ["status", "risk", "priority", "store_id", "rider_id", "route_seq",
                           "assigned_at", "packed_at", "picked_up_at", "delivered_at",
                           "assignment_reason", "failed_reason"]
 RIDER_MUTABLE_COLUMNS = ["lat", "lng", "status", "current_load_kg", "battery_pct",
+                          "busy_seconds", "observed_shift_seconds",
                           "nav_origin_lat", "nav_origin_lng", "nav_target_lat", "nav_target_lng", "route_progress_km"]
 INVENTORY_MUTABLE_COLUMNS = ["qty", "reserved_qty"]
 
@@ -41,6 +42,7 @@ class World:
         self.catalog: list[tuple] = []  # (sku, name, weight_kg) — set by simulator at import time
 
         self.pending_events: list[OrderEvent] = []
+        self.events: list[OrderEvent] = []
         self.pending_new_orders: list[Order] = []
         self.dirty_order_ids: set[str] = set()
         self.dirty_rider_ids: set[str] = set()
@@ -49,7 +51,9 @@ class World:
 
     # -- mutation helpers used by the tick loop and by disruption/order endpoints --
     def log_event(self, order_id: str, type_: str, payload: dict | None = None):
-        self.pending_events.append(OrderEvent(order_id=order_id, type=type_, payload=payload or {}))
+        event = OrderEvent(order_id=order_id, type=type_, payload=payload or {}, ts=dt.datetime.now(dt.timezone.utc))
+        self.pending_events.append(event)
+        self.events.append(event)
 
     def mark_order_dirty(self, order_id: str):
         self.dirty_order_ids.add(order_id)
@@ -142,6 +146,7 @@ async def load_world():
         riders = (await session.execute(select(Rider))).scalars().all()
         orders = (await session.execute(select(Order))).scalars().all()
         inventory = (await session.execute(select(InventoryItem))).scalars().all()
+        events = (await session.execute(select(OrderEvent).order_by(OrderEvent.ts))).scalars().all()
         session.expunge_all()
 
     world.stores = list(stores)
@@ -151,6 +156,7 @@ async def load_world():
     world.orders = {o.id: o for o in orders}
     world.inventory = {(i.store_id, i.sku): i for i in inventory}
     world.pending_events = []
+    world.events = list(events)
     world.pending_new_orders = []
     world.dirty_order_ids = set()
     world.dirty_rider_ids = set()
@@ -204,7 +210,7 @@ async def persist_once(session: AsyncSession | None = None):
             for o in new_orders:
                 s.add(Order(**{col.name: getattr(o, col.name) for col in Order.__table__.columns}))
             for e in events:
-                s.add(OrderEvent(order_id=e.order_id, type=e.type, payload=e.payload))
+                s.add(OrderEvent(order_id=e.order_id, type=e.type, payload=e.payload, ts=e.ts))
             if order_rows:
                 await s.execute(sa_update(Order), order_rows)
             if rider_rows:

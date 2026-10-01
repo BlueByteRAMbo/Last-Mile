@@ -32,3 +32,14 @@ async def test_auto_migrate_adds_missing_columns_to_an_existing_table():
         assert row[0] == "Customer"  # column default applied
 
     await engine.dispose()
+
+
+async def test_rider_time_counters_migrate_with_zero_defaults():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.execute(text("CREATE TABLE riders (id VARCHAR PRIMARY KEY)"))
+        await conn.execute(text("INSERT INTO riders (id) VALUES ('OLD-RIDER')"))
+        await auto_migrate(conn)
+        row = (await conn.execute(text("SELECT busy_seconds, observed_shift_seconds FROM riders"))).one()
+        assert tuple(row) == (0, 0)
+    await engine.dispose()

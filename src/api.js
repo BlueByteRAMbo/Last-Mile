@@ -1,7 +1,25 @@
 const BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 const WS_BASE = BASE.replace(/^http/, 'ws');
 
+async function request(path, body) {
+  const response = await fetch(`${BASE}${path}`, body === undefined ? {} : {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Request failed. Please check your inputs.');
+  return data;
+}
+
 export const api = {
+  dispatchMode: () => request('/dispatch/mode'),
+  setDispatchMode: mode => request('/dispatch/mode', { mode }),
+  comparison: () => request('/analytics/comparison'),
+  interveneOrder: async (id, action) => {
+    const response = await fetch(`${BASE}/orders/${encodeURIComponent(id)}/intervene/${action}`, { method: 'POST' });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.detail || 'Intervention failed');
+    return body;
+  },
   darkStores: () => fetch(`${BASE}/dark_stores`).then(r => r.json()),
   storeInventory: (id) => fetch(`${BASE}/dark_stores/${id}/inventory`).then(r => r.json()),
   riders: () => fetch(`${BASE}/riders`).then(r => r.json()),

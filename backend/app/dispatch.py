@@ -307,10 +307,12 @@ async def allocate(session, order: Order) -> dict:
     return {"chosen": feasible[0], "alternatives": feasible[1:5], "all_count": len(candidates), "suggestion": None}
 
 
-def allocate_sync(order: Order, stores, riders, active_by_rider, inventory_map) -> dict:
+def allocate_sync(order: Order, stores, riders, active_by_rider, inventory_map, mode="optimized") -> dict:
     """Pure in-memory version — see allocate() above for the shape (chosen=None + suggestion when infeasible)."""
     candidates = score_candidates_sync(order, stores, riders, active_by_rider, inventory_map)
     feasible = [c for c in candidates if c["feasible"]]
+    if mode == "nearest":
+        feasible.sort(key=lambda c: (c["reason"]["pickup_eta_seconds"], c["store_id"], c["rider_id"]))
     if not feasible:
         return {"chosen": None, "alternatives": [], "all_count": len(candidates),
                 "suggestion": suggest_split_fulfillment(order, stores, inventory_map)}

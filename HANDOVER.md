@@ -153,30 +153,71 @@ which reflects what's real and tested, not what was asked for.
 
 ## What's NOT done — Phases 4, 5, 6
 
-### Phase 4 (Tracking, prioritisation, analytics) — not started
+### Phase 4 (Tracking, prioritisation, analytics) — implemented
 
-1. WebSocket tick payload needs: per-order `eta_seconds`, `predicted_late` (bool), `customer_name`,
+Update (2026-10-01): `tracking.py` now supplies shared live ETA projections for
+`build_snapshot()` and `/track/{id}`. Snapshot orders include customer name, ETA,
+predicted lateness and route version; riders include remaining geometry, heading,
+assigned order IDs and an approximate-route flag. Geometry hashes stay stable during
+movement and change when the path changes. ETA includes packing, pickup-before-drop,
+earlier deliveries, cached geometry and traffic; it remains an estimate (packing queue
+contention and future route changes are not forecast). Unassigned/offline ETA is null.
+Terminal orders remain excluded from ops snapshots; tracking HTTP returns delivered ETA 0.
+64 backend tests pass; frontend production build passes with the existing chunk-size warning.
+Live WebSocket, customer tracking HTTP and frontend HTTP smoke checks pass using isolated
+in-memory SQLite. Real Neon/Mapbox integration has not been revalidated in this increment.
+Next increment (2026-10-01): the Orders tab now defaults to a live priority queue
+(urgency from ETA/deadline slack + 5 express points + overdue minutes), with an at-risk
+filter, ETA and predicted-late labels. Per-order boost/reassign/cancel controls call
+`POST /orders/{id}/intervene/{action}` and display failures instead of reporting false success.
+Reassignment selects another feasible rider at the same store, preserves packing and stock,
+updates rider loads and route sequence, and logs REASSIGNED. If no alternative is feasible,
+the assignment is kept (HTTP 409); picked-up and terminal orders cannot be reassigned.
+Boost is idempotent, logged, and persists through `ORDER_MUTABLE_COLUMNS` (priority was
+previously missing). Cancel uses the existing stock/load release behavior. Queue scores are
+in ops REST/WebSocket payloads but excluded from customer tracking HTTP.
+69 tests pass; production build passes with the existing chunk-size warning. Live isolated
+SQLite HTTP + WebSocket smoke checks pass for boost, reassignment and cancellation.
+Analytics increment (2026-10-01): `/analytics` and `/kpis` now share an in-memory
+projection with per-rider time utilization, workload Gini, separate failed/cancelled
+and overdue counts, named nearest-hub catchment demand, distinct-order delay signals,
+and five-minute on-time rates over the last hour with disruption impact events.
+Rider `busy_seconds` and `observed_shift_seconds` auto-migrate and persist. The tick
+samples simulated shift time: active assignment means busy, offline means idle,
+expired shifts stop counting, and server downtime is excluded. Historical utilization
+before these counters existed cannot be reconstructed and starts at zero.
+`world.events` is loaded once and appended alongside pending persistence events; event
+timestamps now record occurrence time, not flush time. Analytics never queries the DB.
+Packing-wait signals are current at-risk packing orders, not historical causal proof;
+other delay signals come from events and may overlap. Unallocated is intentionally not
+labelled rider shortage because it can also mean stock constraints. Empty delivery
+intervals have null rates. The Analytics tab charts these metrics and displays a
+heatmap weighted at hub centers (catchment aggregates, not customer point density).
+76 tests pass, including migration defaults and persistence/reload/reset behavior.
+Live isolated SQLite analytics/disruption/reset HTTP checks pass. Production build
+passes with the existing large-bundle warning; real Mapbox rendering and Neon have
+not been revalidated. Phase 4 is not complete: baseline comparison remains next.
+
+1. Implemented in the update above: per-order `eta_seconds`, `predicted_late` (bool), `customer_name`,
    route polyline version; per-rider `current polyline remaining`, `assigned order ids`, `heading`.
-   Currently `simulator.py:build_snapshot()` sends a much thinner payload — extend it. The rider's
+   `simulator.py:build_snapshot()` now sends this extended payload. The rider's
    real polyline is available via `routing.get_cached_route(rider.nav_origin_lat, ...)` if you want
    to send the actual remaining geometry, not just lat/lng.
-2. Ops view: priority queue panel (urgency + express + delay age), at-risk list, per-order
-   intervention buttons (reassign/boost priority/cancel). The backend already has `cancel` and
-   `rider_offline` disruptions to wire buttons to; "reassign" and "boost priority" need new
-   endpoints — reassign can probably reuse `world.reassign_rider_orders` logic, boost-priority is
-   just `order.priority = True` + `world.mark_order_dirty`.
+2. Implemented: Orders tab priority queue, at-risk filter and per-order intervention buttons
+   (reassign/boost priority/cancel). See the next-increment notes above for endpoint semantics.
 3. Customer tracker (`#track/{id}`, `src/pages/CustomerTracker.jsx`) already exists from an earlier
    session — Phase 5 asks you to extend it with live map/timeline; see Phase 5 below.
-4. New analytics: true rider utilization (busy time / shift time — needs tracking cumulative busy
-   seconds per rider, not currently tracked), zone density by named zone or H3 hex + heatmap layer
-   (currently just a flat lat/lng-rounded bucket in `/kpis`), delay-reason breakdown (the
-   `OrderEvent` log already has the raw material — `DELAY_RISK`, `STOCK_OUT_REALLOCATE`,
-   `RIDER_OFFLINE`, `ROUTE_CHANGED` events carry a `reason`/`payload` — aggregate them), on-time %
-   time series with disruption markers (needs a new endpoint querying `OrderEvent` over time),
-   rider workload fairness (Gini coefficient — pure math over `delivered_count` per rider).
-5. Baseline comparison (naive-nearest-rider vs current engine, side by side) — would need a second,
-   simpler allocation function and a way to run both against the same seeded order stream and diff
-   the KPIs. Not started; biggest remaining backend lift in Phase 4.
+4. Implemented: time utilization, named catchment demand and heatmap, delay-signal
+   breakdown, on-time series with disruption impacts, and workload Gini. See analytics
+   increment notes above for definitions and validation limits.
+5. Baseline comparison is implemented. Analytics offers a live dispatch mode selector and
+   an isolated 36-order, seed-42 replay of both modes using the real tick engine. The same
+   initial inventory/riders and order stream are used, with deterministic straight-line routes
+   and no external disruptions. Results include delivered-only and all-order on-time rates,
+   average delivery time, failures and unfinished orders. `/analytics/comparison` caches the
+   reproducible replay result; `/dispatch/mode` controls future live allocations. Nearest
+   mode retains eligibility checks but ranks by pickup ETA and disables rolling optimization.
+   Seed inventory now resets deterministically (the old module RNG drifted across resets).
 
 ### Phase 5 (the guided demo flow) — not started, this is the big one
 

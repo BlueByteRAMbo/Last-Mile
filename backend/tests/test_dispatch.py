@@ -1,5 +1,17 @@
 import datetime as dt
 import pytest
+
+
+def test_naive_mode_chooses_nearest_eligible_rider_instead_of_weighted_cost(monkeypatch):
+    from app import dispatch
+    candidates = [
+        {'feasible': True, 'cost': 1, 'store_id': 'S', 'rider_id': 'far', 'reason': {'pickup_eta_seconds': 100}},
+        {'feasible': True, 'cost': 9, 'store_id': 'S', 'rider_id': 'near', 'reason': {'pickup_eta_seconds': 10}},
+        {'feasible': False, 'cost': 0, 'store_id': 'S', 'rider_id': 'ineligible', 'reason': {'pickup_eta_seconds': 0}},
+    ]
+    monkeypatch.setattr(dispatch, 'score_candidates_sync', lambda *args: candidates)
+    assert dispatch.allocate_sync(None, [], [], {}, {}, 'nearest')['chosen']['rider_id'] == 'near'
+    assert dispatch.allocate_sync(None, [], [], {}, {}, 'optimized')['chosen']['rider_id'] == 'far'
 from app.dispatch import (
     score_candidates, score_candidates_sync, allocate, reserve_stock, release_stock,
     reassign_rider_orders, cancel_order, store_has_stock, cheapest_insertion_cost,
