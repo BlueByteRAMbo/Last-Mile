@@ -2,12 +2,13 @@ import datetime as dt
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app import main as main_module
 from app import simulator as simulator_module
+from app import world as world_module
+from app.world import world
 from app.db import Base
 from app.models import Order
 
@@ -17,17 +18,20 @@ pytestmark = pytest.mark.asyncio
 @pytest_asyncio.fixture
 async def client(monkeypatch):
     """Spin up the real FastAPI app against an isolated in-memory DB, with the background
-    tick loop disabled so tests control state deterministically instead of racing it."""
+    tick loop and persist loop disabled so tests control state deterministically instead of
+    racing them. State lives in the in-memory `world` (see app/world.py) — the DB here only
+    backs the initial seed and whatever /reset or an explicit persist_once() call writes."""
     engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool, connect_args={"check_same_thread": False})
     SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
     monkeypatch.setattr(main_module, "engine", engine)
     monkeypatch.setattr(main_module, "SessionLocal", SessionLocal)
-    monkeypatch.setattr(simulator_module, "SessionLocal", SessionLocal)
+    monkeypatch.setattr(world_module, "SessionLocal", SessionLocal)
 
-    async def noop_forever():
+    async def noop():
         return
-    monkeypatch.setattr(simulator_module, "run_forever", noop_forever)
+    monkeypatch.setattr(simulator_module, "run_forever", noop)
+    monkeypatch.setattr(simulator_module, "persist_loop", noop)
 
     async with main_module.app.router.lifespan_context(main_module.app):
         transport = ASGITransport(app=main_module.app)
@@ -91,16 +95,14 @@ async def test_rider_offline_disruption_frees_their_orders_via_http(client):
     stores = (await client.get("/dark_stores")).json()
     rider_id, store_id = riders[0]["id"], stores[0]["id"]
 
-    async with client.session_factory() as session:
-        order = Order(
-            id="ORD-HTTPTEST", customer_lat=19.05, customer_lng=72.84,
-            items=[{"sku": "SKU-MILK", "name": "Milk 1L", "qty": 1, "weight_kg": 0.5}],
-            weight_kg=0.5, priority=False, created_at=dt.datetime.now(dt.timezone.utc),
-            promised_at=dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=20),
-            status="packing", store_id=store_id, rider_id=rider_id,
-        )
-        session.add(order)
-        await session.commit()
+    order = Order(
+        id="ORD-HTTPTEST", customer_lat=19.05, customer_lng=72.84,
+        items=[{"sku": "SKU-MILK", "name": "Milk 1L", "qty": 1, "weight_kg": 0.5}],
+        weight_kg=0.5, priority=False, created_at=dt.datetime.now(dt.timezone.utc),
+        promised_at=dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=20),
+        status="packing", store_id=store_id, rider_id=rider_id,
+    )
+    world.orders[order.id] = order  # seed world state directly — world is the source of truth now
 
     r = await client.post(f"/disruptions/rider_offline?target={rider_id}")
     assert r.json()["ok"] is True
@@ -118,28 +120,20 @@ async def test_cancel_disruption_releases_reserved_stock_via_http(client):
     stores = (await client.get("/dark_stores")).json()
     store_id = stores[0]["id"]
 
-    async with client.session_factory() as session:
-        from app.models import InventoryItem
-        inv = (await session.execute(select(InventoryItem).where(InventoryItem.store_id == store_id, InventoryItem.sku == "SKU-MILK"))).scalar_one()
-        inv.reserved_qty += 2
-        await session.commit()
-        order = Order(
-            id="ORD-CANCELTEST", customer_lat=19.05, customer_lng=72.84,
-            items=[{"sku": "SKU-MILK", "name": "Milk 1L", "qty": 2, "weight_kg": 0.5}],
-            weight_kg=1.0, priority=False, created_at=dt.datetime.now(dt.timezone.utc),
-            promised_at=dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=20),
-            status="packing", store_id=store_id,
-        )
-        session.add(order)
-        await session.commit()
+    inv = world.inventory[(store_id, "SKU-MILK")]
+    inv.reserved_qty += 2
+    order = Order(
+        id="ORD-CANCELTEST", customer_lat=19.05, customer_lng=72.84,
+        items=[{"sku": "SKU-MILK", "name": "Milk 1L", "qty": 2, "weight_kg": 0.5}],
+        weight_kg=1.0, priority=False, created_at=dt.datetime.now(dt.timezone.utc),
+        promised_at=dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=20),
+        status="packing", store_id=store_id,
+    )
+    world.orders[order.id] = order
 
     r = await client.post("/disruptions/cancel?target=ORD-CANCELTEST")
     assert r.json()["ok"] is True
-
-    async with client.session_factory() as session:
-        from app.models import InventoryItem
-        inv = (await session.execute(select(InventoryItem).where(InventoryItem.store_id == store_id, InventoryItem.sku == "SKU-MILK"))).scalar_one()
-        assert inv.reserved_qty == 0
+    assert world.inventory[(store_id, "SKU-MILK")].reserved_qty == 0
 
 
 async def test_traffic_disruption_creates_a_zone(client):

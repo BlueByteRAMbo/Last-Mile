@@ -17,6 +17,7 @@ W_DEADLINE = 15.0
 W_BATCH = 6.0
 W_STABILITY = 4.0
 W_PRIORITY = 5.0
+LOW_BATTERY_PCT = 15.0
 
 try:
     from ortools.constraint_solver import routing_enums_pb2, pywrapcp
@@ -158,10 +159,18 @@ def score_candidates_sync(order: Order, stores, riders, active_by_rider: dict, i
                 continue
             if rider.current_load_kg + order.weight_kg > rider.capacity_kg:
                 continue
+            if rider.battery_pct < LOW_BATTERY_PCT:
+                continue
 
             pickup_eta = travel_seconds(rider.lat, rider.lng, store.lat, store.lng, rider.speed_kmh)
             drop_eta = travel_seconds(store.lat, store.lng, order.customer_lat, order.customer_lng, rider.speed_kmh)
             total_eta = pickup_eta + packing_wait + drop_eta
+
+            shift_end = rider.shift_end
+            if shift_end and shift_end.tzinfo is None:  # sqlite round-trips drop tzinfo; Postgres doesn't
+                shift_end = shift_end.replace(tzinfo=dt.timezone.utc)
+            if shift_end and now + dt.timedelta(seconds=total_eta) > shift_end:
+                continue  # wouldn't be back within shift even before packing/traffic delays
 
             deadline_risk = max(0.0, (total_eta - deadline_s) / 60.0)  # minutes over promise
             rider_active = active_by_rider.get(rider.id, [])
@@ -326,6 +335,25 @@ async def riders_affected_by_zone(session, zone: dict) -> list[str]:
     """Which riders have an active route leg (rider->stop or stop->stop) passing through this zone."""
     riders = (await session.execute(select(Rider))).scalars().all()
     by_rider = await riders_on_active_route(session)
+    affected = []
+    for rider in riders:
+        stops = by_rider.get(rider.id)
+        if not stops:
+            continue
+        points = [(rider.lat, rider.lng)] + [(o.customer_lat, o.customer_lng) for o in sorted(stops, key=lambda x: x.route_seq or 0)]
+        for (lat1, lng1), (lat2, lng2) in zip(points, points[1:]):
+            if _segment_intersects_zone(lat1, lng1, lat2, lng2, zone):
+                affected.append(rider.id)
+                break
+    return affected
+
+
+def riders_affected_by_zone_sync(zone: dict, riders: list[Rider], active_orders: list[Order]) -> list[str]:
+    """Pure in-memory version for the world-state tick loop — no DB access."""
+    by_rider: dict[str, list[Order]] = {}
+    for o in active_orders:
+        if o.rider_id:
+            by_rider.setdefault(o.rider_id, []).append(o)
     affected = []
     for rider in riders:
         stops = by_rider.get(rider.id)

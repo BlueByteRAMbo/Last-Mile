@@ -8,7 +8,7 @@ Coverage of the official problem statement is **PRIORITY #1**. Every mandatory f
 
 ## Environment & Configuration
 - **Mapbox Access Token:** Read dynamically from `VITE_MAPBOX_TOKEN` in `.env`
-- **Database URL (Neon PostgreSQL):** `postgresql://neondb_owner:npg_8U6zkFMBWpon@ep-dark-smoke-b536ei2e-pooler.c-7.us-east-2.aws.neon.tech/neondb?sslmode=require`
+- **Database URL (Neon PostgreSQL):** Read from `DATABASE_URL` in `.env` (never commit the real value — see `.env.example`)
 - **3D Asset Paths:**
   - Delivery Rider Model: `/public/models/delivery-rider.glb` (or `/delivery_rider_3d.glb`)
   - Dark Warehouse Model: `/public/models/warehouse.glb` (or `/warehouse.glb`)

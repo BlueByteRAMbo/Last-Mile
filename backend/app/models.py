@@ -38,7 +38,7 @@ class Rider(Base):
     capacity_kg: Mapped[float] = mapped_column(Float, default=15.0)
     current_load_kg: Mapped[float] = mapped_column(Float, default=0.0)
     speed_kmh: Mapped[float] = mapped_column(Float, default=28.0)
-    battery_pct: Mapped[int] = mapped_column(Integer, default=100)
+    battery_pct: Mapped[float] = mapped_column(Float, default=100.0)
     status: Mapped[str] = mapped_column(String, default="AVAILABLE")  # AVAILABLE/ON_DELIVERY/OFFLINE
     shift_end: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
 
