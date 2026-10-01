@@ -1,6 +1,7 @@
 import React from 'react';
 import { Activity } from 'lucide-react';
 import TrackOrderWidget from './TrackOrderWidget';
+import SpeedSelector from './SpeedSelector';
 
 const TopNavigation = ({ liveOperations, setLiveOperations, activeTab, onTabChange }) => {
   return (
@@ -41,8 +42,11 @@ const TopNavigation = ({ liveOperations, setLiveOperations, activeTab, onTabChan
         <div className="w-px h-4 bg-white/10"></div>
         <TrackOrderWidget />
         <div className="w-px h-4 bg-white/10"></div>
-        <div className="text-sm font-medium text-slate-300">Mumbai</div>
-        <div className="text-sm text-slate-500">{new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>
+        <div className="text-sm font-medium text-slate-300 hidden lg:block">Mumbai</div>
+        <div className="text-sm text-slate-500 hidden lg:block">{new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>
+      </div>
+      <div className="absolute top-20 right-6 pointer-events-auto">
+        <SpeedSelector />
       </div>
     </div>
   );

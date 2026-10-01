@@ -72,6 +72,21 @@ async def set_dispatch_mode(body: DispatchMode):
     return {'mode': body.mode}
 
 
+class SimSpeedBody(BaseModel):
+    multiplier: Literal[1, 10, 20, 40]
+
+
+@app.get('/simulation/speed')
+async def get_sim_speed():
+    return {'multiplier': simulator.state['tick_speed_multiplier']}
+
+
+@app.post('/simulation/speed')
+async def set_sim_speed(body: SimSpeedBody):
+    simulator.state['tick_speed_multiplier'] = body.multiplier
+    return {'multiplier': body.multiplier}
+
+
 @app.get('/analytics/comparison')
 async def dispatch_comparison():
     from .comparison import comparison

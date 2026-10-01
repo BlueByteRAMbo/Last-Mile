@@ -46,14 +46,18 @@ def fetch(url):
 
 
 async def check():
+    live = '--live' in sys.argv
+    frontend = 'http://127.0.0.1:5176' if live else 'http://127.0.0.1:5178'
+    backend = 'http://127.0.0.1:8000' if live else 'http://127.0.0.1:8012'
     env = dict(os.environ, DATABASE_URL='sqlite+aiosqlite:///:memory:', VITE_API_URL='http://127.0.0.1:8012')
     artifact = Path(tempfile.mkdtemp(prefix='routex-phase5-'))
     log = (artifact / 'servers.log').open('w', encoding='utf-8')
     processes = []
     errors = []
     try:
-        processes.append(subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--serve'], cwd=ROOT / 'backend', env=env, stdout=log, stderr=log))
-        processes.append(subprocess.Popen(['node', 'node_modules/vite/bin/vite.js', '--host', '127.0.0.1', '--port', '5178', '--strictPort'], cwd=ROOT, env=env, stdout=log, stderr=log))
+        if not live:
+            processes.append(subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--serve'], cwd=ROOT / 'backend', env=env, stdout=log, stderr=log))
+            processes.append(subprocess.Popen(['node', 'node_modules/vite/bin/vite.js', '--host', '127.0.0.1', '--port', '5178', '--strictPort'], cwd=ROOT, env=env, stdout=log, stderr=log))
         chrome = Path('C:/Program Files/Google/Chrome/Application/chrome.exe')
         processes.append(subprocess.Popen([str(chrome), '--headless=new', '--no-first-run', '--no-default-browser-check',
             '--remote-debugging-port=9225', '--use-angle=swiftshader', '--enable-unsafe-swiftshader',
@@ -61,8 +65,8 @@ async def check():
         for _ in range(60):
             try:
                 pages = fetch('http://127.0.0.1:9225/json')
-                fetch('http://127.0.0.1:8012/catalog')
-                with urllib.request.urlopen('http://127.0.0.1:5178', timeout=2):
+                fetch(backend + '/catalog')
+                with urllib.request.urlopen(frontend, timeout=2):
                     pass
                 break
             except Exception:
@@ -98,9 +102,9 @@ async def check():
                 (artifact / 'failure.json').write_text(json.dumps({
                     'condition': expression, 'url': await js('location.href'),
                     'page_text': await js('document.body.innerText'),
-                    'orders': fetch('http://127.0.0.1:8012/orders'),
-                    'riders': fetch('http://127.0.0.1:8012/riders'),
-                    'traffic_zones': fetch('http://127.0.0.1:8012/traffic_zones'),
+                    'orders': fetch(backend + '/orders'),
+                    'riders': fetch(backend + '/riders'),
+                    'traffic_zones': fetch(backend + '/traffic_zones'),
                     'errors': errors,
                 }, indent=2), encoding='utf-8')
                 raise AssertionError(f'Timed out: {expression}; diagnostics: {artifact}')
@@ -110,6 +114,29 @@ async def check():
             await command('Runtime.enable')
             await command('Page.enable')
             await command('Emulation.setDeviceMetricsOverride', {'width': 1440, 'height': 1000, 'deviceScaleFactor': 1, 'mobile': False})
+            if live:
+                await command('Page.navigate', {'url': frontend + '/#ops'})
+                await until("document.querySelectorAll('.ops-store-marker').length === 5")
+                await screenshot('live-ops.png')
+                order = next(o for o in fetch(backend + '/orders') if o['rider_id'] and o['status'] in ('assigned', 'packing', 'packed', 'out_for_delivery'))
+                await command('Page.navigate', {'url': frontend + '/#journey/' + order['id']})
+                await until("document.querySelector('.journey-hud') && document.querySelectorAll('.stock-row').length === 5")
+                await until("Array.from(document.querySelectorAll('.journey-label')).some(el => el.textContent.includes('Rider'))")
+                await asyncio.sleep(3)
+                assert 'Reconnecting' not in await js('document.body.innerText')
+                await screenshot('live-journey.png')
+                await command('Page.navigate', {'url': frontend + '/#track/' + order['id']})
+                await until("document.querySelector('.customer-details') && document.body.innerText.includes('Live updates')")
+                await screenshot('live-tracker.png')
+                await command('Page.addScriptToEvaluateOnNewDocument', {'source': 'window.socketCount=0; const NativeSocket=window.WebSocket; window.WebSocket=class extends NativeSocket { constructor(...args) { super(...args); window.socketCount++; } };'})
+                await command('Page.navigate', {'url': frontend + '/#track/nonexistent-regression-order'})
+                await until("document.body.innerText.includes('no longer available')")
+                count = await js('window.socketCount')
+                await asyncio.sleep(4)
+                assert await js('window.socketCount') == count
+                assert not errors, errors
+                print(json.dumps({'live_browser': 'passed', 'warehouses': 5, 'rider_assigned': order['rider_id'], 'tracking': 'stable', 'missing_order_retry_loop': False, 'screenshots': str(artifact)}))
+                return
             await command('Page.navigate', {'url': 'http://127.0.0.1:5178/#shop'})
             await until("document.querySelectorAll('.product-card').length === 22")
             await screenshot('shop.png')

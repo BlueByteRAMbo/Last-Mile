@@ -7,6 +7,9 @@
 .flow-header a:hover { color: #38bdf8; }
 .flow-brand { font-size: 21px; font-weight: 800; letter-spacing: .12em; }
 .flow-brand span { display: block; font-size: 9px; color: #38bdf8; letter-spacing: .22em; margin-top: 4px; }
+.ops-store-marker { display: flex; align-items: center; gap: 6px; z-index: 2; }
+.ops-store-icon { display: grid; place-items: center; width: 28px; height: 28px; border: 2px solid #7dd3fc; border-radius: 6px; background: #082f49; color: #e0f2fe; font-size: 22px; }
+.ops-store-label { padding: 4px 7px; border: 1px solid #38bdf855; border-radius: 5px; background: #080e17ee; color: #e2e8f0; font-size: 11px; white-space: nowrap; }
 .flow-page h1 { font-size: clamp(26px, 3.5vw, 46px); font-weight: 650; letter-spacing: -.04em; line-height: 1.16; }
 .flow-page h2 { font-size: 20px; font-weight: 600; letter-spacing: -.02em; }
 .flow-page h3 { font-size: 14px; font-weight: 600; }

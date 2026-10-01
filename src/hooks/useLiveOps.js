@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api, connectWs } from '../api';
 
 // Live state backed by the FastAPI + Neon backend: REST for initial load, WS ticks after.
@@ -23,7 +23,7 @@ export default function useLiveOps() {
       setRiders(msg.riders);
       setOrders(msg.orders);
       setTrafficZones(msg.traffic_zones || []);
-    });
+    }, '/ws', setConnected);
 
     const kpiInterval = setInterval(() => api.kpis().then(setKpis).catch(() => {}), 4000);
     // dark store packing/queue counts aren't in the WS tick payload, poll them separately

@@ -35,6 +35,7 @@ state = {
     "dispatch_mode": "optimized",
     "order_spawn_rate": 0.35,  # probability per tick of a new order
     "blocked_store_ids": set(),
+    "tick_speed_multiplier": 1,  # 1, 10, 20, or 50 — compresses simulation time each tick
 }
 
 _rng = random.Random(SEED)
@@ -179,13 +180,14 @@ def _leg_polyline_and_length(rider):
 def move_riders(active_orders):
     by_rider = _group_by(active_orders, ["packed", "out_for_delivery"], "rider_id")
     now = dt.datetime.now(dt.timezone.utc)
+    speed_mult = state["tick_speed_multiplier"]
 
     for rider in world.riders:
         if rider.status == "OFFLINE":
             continue
         active = sorted(by_rider.get(rider.id, []), key=lambda o: o.route_seq or 0)
         if not active:
-            if rider.status == "ON_DELIVERY":
+            if rider.status in ("ON_DELIVERY", "PICKING_UP"):
                 rider.status = "AVAILABLE"
                 rider.nav_target_lat = rider.nav_target_lng = None
                 world.mark_rider_dirty(rider.id)
@@ -193,7 +195,8 @@ def move_riders(active_orders):
 
         awaiting_pickup = [o for o in active if o.status == "packed"]
         target_order = awaiting_pickup[0] if awaiting_pickup else active[0]
-        if target_order.status == "packed":
+        heading_to_store = target_order.status == "packed"
+        if heading_to_store:
             store = world.store_by_id[target_order.store_id]
             dest_lat, dest_lng = store.lat, store.lng
         else:
@@ -208,7 +211,8 @@ def move_riders(active_orders):
             _pending_route_fetches.append((rider.nav_origin_lat, rider.nav_origin_lng, dest_lat, dest_lng))
 
         polyline, total_km = _leg_polyline_and_length(rider)
-        base_step_km = rider.speed_kmh * (TICK_SECONDS / 3600.0)
+        # speed_mult compresses simulated time: at 10x, each tick covers 10x the distance
+        base_step_km = rider.speed_kmh * (TICK_SECONDS / 3600.0) * speed_mult
 
         # segment-level traffic: check the multiplier against the actual small stretch of road this
         # tick is about to cross, not the whole remaining leg — a zone only slows the part of the
@@ -225,12 +229,14 @@ def move_riders(active_orders):
         rider.route_progress_km = new_progress
 
         if new_progress >= total_km - 1e-6:
-            if target_order.status == "packed":
+            if heading_to_store:
+                # Arrived at store — pick up the order
                 target_order.status = "out_for_delivery"
                 target_order.picked_up_at = now
                 world.mark_order_dirty(target_order.id)
                 world.log_event(target_order.id, "PICKED_UP")
             else:
+                # Arrived at customer — deliver
                 target_order.status = "delivered"
                 target_order.delivered_at = now
                 rider.current_load_kg = max(0.0, rider.current_load_kg - target_order.weight_kg)
@@ -238,7 +244,8 @@ def move_riders(active_orders):
                 world.log_event(target_order.id, "DELIVERED")
             rider.nav_target_lat = rider.nav_target_lng = None  # force a fresh leg next tick
 
-        rider.status = "ON_DELIVERY"
+        # Distinct status: PICKING_UP = en route to store; ON_DELIVERY = en route to customer
+        rider.status = "PICKING_UP" if heading_to_store else "ON_DELIVERY"
         rider.battery_pct = max(0, rider.battery_pct - moved_km * BATTERY_DRAIN_PCT_PER_KM)
         world.mark_rider_dirty(rider.id)
 
@@ -337,22 +344,24 @@ def tick_sync():
     wrapper below so it stays easy to call directly (and time) from tests."""
     global _tick_count
     from .analytics import record_rider_time
-    record_rider_time(TICK_SECONDS)
-    if _rng.random() < state["order_spawn_rate"]:
-        spawn_order()
-
-    active_orders = world.active_orders()
-    for o in [o for o in active_orders if o.status == "created"]:
-        try_allocate(o, active_orders)
-
-    advance_packing(active_orders)
-    move_riders(active_orders)
-    recompute_risk(active_orders)
-    fail_overdue_orders(active_orders)
-
-    _tick_count += 1
-    if state["dispatch_mode"] == "optimized" and _tick_count % REOPTIMIZE_EVERY_N_TICKS == 0:
-        reoptimize_routes(world.active_orders())  # re-fetch: packing/delivery above may have changed who's pending
+    speed_mult = state["tick_speed_multiplier"]
+    # At higher speeds we run multiple virtual sub-ticks per real-time tick so spawn/packing also
+    # advances proportionally, not just movement.
+    sub_ticks = max(1, speed_mult)
+    record_rider_time(TICK_SECONDS * sub_ticks)
+    for _ in range(sub_ticks):
+        if _rng.random() < state["order_spawn_rate"]:
+            spawn_order()
+        active_orders = world.active_orders()
+        for o in [o for o in active_orders if o.status == "created"]:
+            try_allocate(o, active_orders)
+        advance_packing(active_orders)
+        move_riders(active_orders)
+        recompute_risk(active_orders)
+        fail_overdue_orders(active_orders)
+        _tick_count += 1
+        if state["dispatch_mode"] == "optimized" and _tick_count % REOPTIMIZE_EVERY_N_TICKS == 0:
+            reoptimize_routes(world.active_orders())
 
 
 async def tick():
@@ -371,6 +380,7 @@ async def run_forever():
             await tick()
         except Exception as e:  # ponytail: log-and-continue keeps the demo alive; add alerting if this ever fires in prod
             print(f"[simulator] tick error: {e}")
+        # Always sleep real-time TICK_SECONDS; speed is achieved via sub-ticks inside tick_sync()
         await asyncio.sleep(TICK_SECONDS)
 
 

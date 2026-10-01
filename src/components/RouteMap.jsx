@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import mapboxgl from 'mapbox-gl';
 
 // Mapbox Token
@@ -8,20 +8,87 @@ const INITIAL_VIEW = {
   center: [72.8777, 19.0760],
   zoom: 13,
   pitch: 60,
-  bearing: -15
+  bearing: -15,
 };
 
-function riderColor(status) {
-  if (status === 'ON_DELIVERY') return 'bg-route-cyan';
-  if (status === 'OFFLINE') return 'bg-slate-600';
-  return 'bg-route-green';
+// ── Rider status config: bg color (Tailwind), label, emoji ──────────────────
+const RIDER_STATUS = {
+  AVAILABLE:   { bg: '#22c55e', label: 'Available',   emoji: '🟢' },
+  PICKING_UP:  { bg: '#f59e0b', label: 'Picking Up',  emoji: '🏪' },
+  ON_DELIVERY: { bg: '#38bdf8', label: 'On Delivery', emoji: '🛵' },
+  OFFLINE:     { bg: '#64748b', label: 'Offline',     emoji: '⚫' },
+};
+
+// ── Order risk / status → order marker color ─────────────────────────────────
+function orderBg(o) {
+  if (o.risk === 'SEVERE' || o.risk === 'DELAYED') return '#ef4444';
+  if (o.risk === 'AT_RISK') return '#f59e0b';
+  if (o.priority) return '#a78bfa';
+  return '#38bdf8';
 }
 
-function orderColor(o) {
-  if (o.risk === 'SEVERE' || o.risk === 'DELAYED') return 'bg-route-red';
-  if (o.risk === 'AT_RISK') return 'bg-route-amber';
-  if (o.priority) return 'bg-route-cyan';
-  return 'bg-route-cyan';
+function riderStatusCfg(status) {
+  return RIDER_STATUS[status] || RIDER_STATUS.OFFLINE;
+}
+
+// Build a rider DOM marker element with: dot + status badge + hover tooltip
+function buildRiderEl(rider, orders) {
+  const cfg = riderStatusCfg(rider.status);
+  const assignedOrders = orders.filter(o => o.rider_id === rider.id && !['delivered','failed','cancelled'].includes(o.status));
+
+  const wrap = document.createElement('div');
+  wrap.className = 'rider-marker-wrap';
+  wrap.style.cssText = 'position:relative;display:flex;flex-direction:column;align-items:center;gap:2px;cursor:pointer;';
+
+  // Status badge (floats above the dot)
+  const badge = document.createElement('div');
+  badge.className = 'rider-badge';
+  badge.style.cssText = `
+    background:${cfg.bg};color:#000;font-size:9px;font-weight:700;
+    padding:1px 5px;border-radius:999px;white-space:nowrap;
+    box-shadow:0 1px 4px rgba(0,0,0,0.5);border:1px solid rgba(255,255,255,0.3);
+    pointer-events:none;line-height:1.4;
+  `;
+  badge.textContent = cfg.label.toUpperCase();
+
+  // Dot
+  const dot = document.createElement('div');
+  dot.style.cssText = `
+    width:14px;height:14px;border-radius:50%;background:${cfg.bg};
+    border:2px solid rgba(255,255,255,0.8);box-shadow:0 0 0 2px ${cfg.bg}55,0 2px 8px rgba(0,0,0,0.5);
+    transition:transform 0.15s;
+  `;
+
+  // Hover tooltip
+  const tip = document.createElement('div');
+  tip.style.cssText = `
+    display:none;position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);
+    background:rgba(15,23,42,0.97);color:#e2e8f0;font-size:11px;
+    border-radius:8px;border:1px solid rgba(255,255,255,0.12);
+    padding:8px 10px;min-width:160px;max-width:220px;
+    box-shadow:0 8px 24px rgba(0,0,0,0.6);z-index:100;pointer-events:none;
+    white-space:nowrap;
+  `;
+
+  const orderLines = assignedOrders.length
+    ? assignedOrders.map(o => {
+        const stIcon = { created:'⏳', assigned:'📋', packing:'📦', packed:'✅', out_for_delivery:'🛵', delivered:'🏁' }[o.status] || '•';
+        return `<div style="margin-top:4px;color:#94a3b8;font-size:10px">${stIcon} ${o.customer_name || o.id} · <span style="color:${orderBg(o)}">${(o.status||'').replace('_',' ')}</span></div>`;
+      }).join('')
+    : '<div style="color:#64748b;margin-top:2px;font-size:10px">No active orders</div>';
+
+  tip.innerHTML = `
+    <div style="font-weight:700;color:#f1f5f9">${cfg.emoji} ${rider.name}</div>
+    <div style="color:${cfg.bg};font-size:10px;margin-top:1px">${cfg.label}</div>
+    <div style="margin-top:4px;color:#94a3b8;font-size:10px">🔋 ${rider.battery_pct}% · Load ${rider.current_load_kg?.toFixed(1)}/${rider.capacity_kg}kg</div>
+    ${orderLines}
+  `;
+
+  wrap.addEventListener('mouseenter', () => { tip.style.display = 'block'; dot.style.transform = 'scale(1.4)'; });
+  wrap.addEventListener('mouseleave', () => { tip.style.display = 'none'; dot.style.transform = ''; });
+
+  wrap.append(tip, badge, dot);
+  return wrap;
 }
 
 // Real backend state drives every marker: dark stores, riders (from /riders + WS ticks) and
@@ -29,6 +96,8 @@ function orderColor(o) {
 const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [], demandZones = [], showDemandHeatmap = false, simulationMode, onMapLoad }) => {
   const mapContainer = useRef(null);
   const map = useRef(null);
+  const [mapReady, setMapReady] = useState(false);
+  const fittedStores = useRef(false);
   const storeMarkers = useRef([]);
   const riderMarkers = useRef(new Map()); // id -> {marker, el}
   const orderMarkers = useRef(new Map());
@@ -39,10 +108,7 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
 
   useEffect(() => {
     if (map.current) return;
-    if (!mapboxgl.accessToken) {
-      console.error('Mapbox token is missing!');
-      return;
-    }
+    if (!mapboxgl.accessToken) { console.error('Mapbox token is missing!'); return; }
     map.current = new mapboxgl.Map({
       container: mapContainer.current,
       style: 'mapbox://styles/mapbox/standard',
@@ -51,15 +117,24 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
     });
     map.current.on('style.load', () => {
       map.current.setConfigProperty('basemap', 'theme', 'night');
+      setMapReady(true);
       if (onMapLoad) onMapLoad(map.current);
     });
     return () => {
+      storeMarkers.current.forEach(m => m.remove());
+      riderMarkers.current.forEach(e => e.marker.remove());
+      orderMarkers.current.forEach(e => e.marker.remove());
+      storeMarkers.current = [];
+      riderMarkers.current.clear();
+      orderMarkers.current.clear();
+      fittedStores.current = false;
+      setMapReady(false);
       map.current?.remove();
       map.current = null;
     };
   }, []);
 
-  // Aggregate demand by named hub catchment; visible while reviewing analytics.
+  // Demand heatmap
   useEffect(() => {
     const m = map.current;
     if (!m) return;
@@ -86,20 +161,18 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
     return () => { m.off('style.load', update); };
   }, [demandZones, showDemandHeatmap]);
 
-  // Live congestion zones from the backend (real disruptions, not static mock data): a circle per zone.
+  // Live traffic zones
   useEffect(() => {
     const m = map.current;
-    if (!m || !m.isStyleLoaded()) return;
+    if (!m || !mapReady) return;
     const toCircle = (zone) => {
-      const points = 48;
-      const coords = [];
-      const km = zone.radius_km;
-      const { lng, lat } = zone;
+      const points = 48; const coords = [];
+      const km = zone.radius_km; const { lng, lat } = zone;
       for (let i = 0; i < points; i++) {
-        const theta = (i / points) * (2 * Math.PI);
+        const theta = (i / points) * 2 * Math.PI;
         const dx = (km / 111.32) * Math.cos(theta);
         const dy = (km / 111.32) * Math.sin(theta);
-        coords.push([lng + dx / Math.cos(lat * (Math.PI / 180)), lat + dy]);
+        coords.push([lng + dx / Math.cos(lat * Math.PI / 180), lat + dy]);
       }
       coords.push(coords[0]);
       return { type: 'Feature', properties: { id: zone.id }, geometry: { type: 'Polygon', coordinates: [coords] } };
@@ -109,33 +182,30 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
       m.getSource('traffic-zones').setData(data);
     } else {
       m.addSource('traffic-zones', { type: 'geojson', data });
-      m.addLayer({
-        id: 'traffic-zones-fill', type: 'fill', source: 'traffic-zones',
-        paint: { 'fill-color': '#F87171', 'fill-opacity': 0.15 },
-      });
-      m.addLayer({
-        id: 'traffic-zones-line', type: 'line', source: 'traffic-zones',
-        paint: { 'line-color': '#F87171', 'line-width': 1.5, 'line-opacity': 0.5 },
-      });
+      m.addLayer({ id: 'traffic-zones-fill', type: 'fill', source: 'traffic-zones', paint: { 'fill-color': '#F87171', 'fill-opacity': 0.15 } });
+      m.addLayer({ id: 'traffic-zones-line', type: 'line', source: 'traffic-zones', paint: { 'line-color': '#F87171', 'line-width': 1.5, 'line-opacity': 0.5 } });
     }
-  }, [trafficZones]);
+  }, [trafficZones, mapReady]);
 
-  // Dark stores: rebuilt when the list changes (rare — stores don't move).
-  // ponytail: tried real GLB warehouse models via mapbox-gl v3 'model' sources first — the installed
-  // mapbox-gl 3.1.2 + Standard style's shadow renderer throws `getModels is not a function` on every
-  // single render frame for any 'model'-type source, confirmed by direct testing (not a config issue).
-  // That's an uncaught exception in the render loop every frame — unshippable. DOM markers below per
-  // the project's own fail-safe-fallback rule; revisit if a later mapbox-gl release fixes it.
+  // Dark store markers
   useEffect(() => {
     const m = map.current;
-    if (!m || !m.isStyleLoaded()) return;
+    if (!m || !mapReady) return;
     storeMarkers.current.forEach(mk => mk.remove());
     storeMarkers.current = [];
     if (simulationMode) return;
     darkStores.forEach(store => {
       const el = document.createElement('div');
-      el.className = 'cursor-pointer';
-      el.innerHTML = `<div class="w-4 h-4 bg-slate-200 border-2 border-route-base rounded-sm shadow-lg flex items-center justify-center transition-transform hover:scale-125 hover:bg-white"></div>`;
+      el.className = 'cursor-pointer ops-store-marker';
+      el.style.cssText = 'display:flex;flex-direction:column;align-items:center;gap:2px;';
+      const icon = document.createElement('div');
+      icon.style.cssText = `
+        background:#1e293b;border:2px solid #7c3aed;border-radius:6px;
+        padding:3px 6px;font-size:11px;color:#c4b5fd;font-weight:700;
+        box-shadow:0 2px 8px rgba(124,58,237,0.4);white-space:nowrap;
+      `;
+      icon.textContent = `🏪 ${store.name}`;
+      el.append(icon);
       el.addEventListener('click', (e) => {
         e.stopPropagation();
         onEntitySelect({ type: 'DARK_STORE', id: store.id, name: store.name, data: store });
@@ -143,42 +213,84 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
       });
       storeMarkers.current.push(new mapboxgl.Marker(el).setLngLat([store.lng, store.lat]).addTo(m));
     });
-  }, [darkStores, simulationMode]);
+    if (!fittedStores.current && darkStores.length) {
+      const bounds = new mapboxgl.LngLatBounds();
+      darkStores.forEach(s => bounds.extend([s.lng, s.lat]));
+      m.fitBounds(bounds, { padding: 90, maxZoom: 13, duration: 600 });
+      fittedStores.current = true;
+    }
+  }, [darkStores, simulationMode, mapReady]);
 
-  // Riders: move existing markers in place every tick instead of rebuilding the DOM.
+  // Rider markers — update in-place each tick, rebuild DOM only when status changes
   useEffect(() => {
     const m = map.current;
-    if (!m || !m.isStyleLoaded() || simulationMode) return;
+    if (!m || !mapReady || simulationMode) return;
     const seen = new Set();
     riders.forEach(rider => {
       seen.add(rider.id);
       let entry = riderMarkers.current.get(rider.id);
+      const needRebuild = !entry || entry.lastStatus !== rider.status;
+
       if (!entry) {
-        const el = document.createElement('div');
-        el.className = 'cursor-pointer z-10';
+        const el = buildRiderEl(rider, ordersRef.current);
         el.addEventListener('click', (e) => {
           e.stopPropagation();
-          const current = ridersRef.current.find(r => r.id === rider.id) || rider;
-          onEntitySelect({ type: 'RIDER', id: current.id, name: current.name, data: current });
-          m.flyTo({ center: [current.lng, current.lat], zoom: 16.5, pitch: 65, speed: 1.2, curve: 1.42 });
+          const cur = ridersRef.current.find(r => r.id === rider.id) || rider;
+          onEntitySelect({ type: 'RIDER', id: cur.id, name: cur.name, data: cur });
+          m.flyTo({ center: [cur.lng, cur.lat], zoom: 16.5, pitch: 65, speed: 1.2, curve: 1.42 });
         });
         const marker = new mapboxgl.Marker(el).setLngLat([rider.lng, rider.lat]).addTo(m);
-        entry = { marker, el };
+        entry = { marker, el, lastStatus: rider.status };
         riderMarkers.current.set(rider.id, entry);
+      } else {
+        entry.marker.setLngLat([rider.lng, rider.lat]);
+        if (needRebuild) {
+          // Swap out the inner content when status changes
+          const newEl = buildRiderEl(rider, ordersRef.current);
+          newEl.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const cur = ridersRef.current.find(r => r.id === rider.id) || rider;
+            onEntitySelect({ type: 'RIDER', id: cur.id, name: cur.name, data: cur });
+            m.flyTo({ center: [cur.lng, cur.lat], zoom: 16.5, pitch: 65, speed: 1.2, curve: 1.42 });
+          });
+          entry.marker.getElement().replaceWith(newEl);
+          entry.el = newEl;
+          entry.lastStatus = rider.status;
+          // mapbox-gl Marker still holds the old element reference; update it
+          entry.marker._element = newEl;
+        } else {
+          // Just refresh tooltip order list inside existing element
+          const tip = entry.el.querySelector('div[style*="position:absolute"]');
+          if (tip) {
+            const cur = ridersRef.current.find(r => r.id === rider.id) || rider;
+            const cfg = riderStatusCfg(cur.status);
+            const assignedOrders = ordersRef.current.filter(o => o.rider_id === cur.id && !['delivered','failed','cancelled'].includes(o.status));
+            const orderLines = assignedOrders.length
+              ? assignedOrders.map(o => {
+                  const stIcon = { created:'⏳', assigned:'📋', packing:'📦', packed:'✅', out_for_delivery:'🛵', delivered:'🏁' }[o.status] || '•';
+                  return `<div style="margin-top:4px;color:#94a3b8;font-size:10px">${stIcon} ${o.customer_name || o.id} · <span style="color:${orderBg(o)}">${(o.status||'').replace('_',' ')}</span></div>`;
+                }).join('')
+              : '<div style="color:#64748b;margin-top:2px;font-size:10px">No active orders</div>';
+            tip.innerHTML = `
+              <div style="font-weight:700;color:#f1f5f9">${cfg.emoji} ${cur.name}</div>
+              <div style="color:${cfg.bg};font-size:10px;margin-top:1px">${cfg.label}</div>
+              <div style="margin-top:4px;color:#94a3b8;font-size:10px">🔋 ${cur.battery_pct}% · Load ${cur.current_load_kg?.toFixed(1)}/${cur.capacity_kg}kg</div>
+              ${orderLines}
+            `;
+          }
+        }
       }
-      entry.marker.setLngLat([rider.lng, rider.lat]);
-      entry.el.innerHTML = `<div class="w-4 h-4 rounded-full border-2 border-route-base shadow-lg ${riderColor(rider.status)} flex items-center justify-center transition-transform hover:scale-125"><div class="w-1 h-1 bg-white rounded-full opacity-50 pointer-events-none"></div></div>`;
       entry.el.style.display = rider.status === 'OFFLINE' ? 'none' : '';
     });
     for (const [id, entry] of riderMarkers.current) {
       if (!seen.has(id)) { entry.marker.remove(); riderMarkers.current.delete(id); }
     }
-  }, [riders, simulationMode]);
+  }, [riders, simulationMode, mapReady]);
 
-  // Orders: same incremental-update pattern, colored by live risk state.
+  // Order markers — colored by risk, pulsing when at-risk/severe
   useEffect(() => {
     const m = map.current;
-    if (!m || !m.isStyleLoaded() || simulationMode) return;
+    if (!m || !mapReady || simulationMode) return;
     const seen = new Set();
     orders.forEach(order => {
       seen.add(order.id);
@@ -188,21 +300,22 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
         el.className = 'cursor-pointer';
         el.addEventListener('click', (e) => {
           e.stopPropagation();
-          const current = ordersRef.current.find(o => o.id === order.id) || order;
-          onEntitySelect({ type: 'ORDER', id: current.id, name: `Order ${current.id}`, data: current });
-          m.flyTo({ center: [current.lng, current.lat], zoom: 16, pitch: 60, speed: 1.2, curve: 1.42 });
+          const cur = ordersRef.current.find(o => o.id === order.id) || order;
+          onEntitySelect({ type: 'ORDER', id: cur.id, name: `Order ${cur.id}`, data: cur });
+          m.flyTo({ center: [cur.lng, cur.lat], zoom: 16, pitch: 60, speed: 1.2, curve: 1.42 });
         });
         const marker = new mapboxgl.Marker(el).setLngLat([order.lng, order.lat]).addTo(m);
         entry = { marker, el };
         orderMarkers.current.set(order.id, entry);
       }
-      const anim = order.risk === 'SEVERE' || order.risk === 'DELAYED' ? 'marker-pulse-red' : (order.priority ? 'marker-pulse' : '');
-      entry.el.innerHTML = `<div class="w-3 h-3 rotate-45 border-2 border-route-base shadow-lg ${orderColor(order)} ${anim} transition-transform hover:scale-125"></div>`;
+      const bg = orderBg(order);
+      const pulse = order.risk === 'SEVERE' || order.risk === 'DELAYED' ? 'marker-pulse-red' : (order.risk === 'AT_RISK' ? 'marker-pulse' : '');
+      entry.el.innerHTML = `<div style="width:10px;height:10px;transform:rotate(45deg);background:${bg};border:1.5px solid rgba(255,255,255,0.7);box-shadow:0 0 6px ${bg}88;" class="${pulse}"></div>`;
     });
     for (const [id, entry] of orderMarkers.current) {
       if (!seen.has(id)) { entry.marker.remove(); orderMarkers.current.delete(id); }
     }
-  }, [orders, simulationMode]);
+  }, [orders, simulationMode, mapReady]);
 
   useEffect(() => {
     if (map.current) {

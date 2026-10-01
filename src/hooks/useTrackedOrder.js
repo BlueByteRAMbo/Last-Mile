@@ -9,14 +9,26 @@ export default function useTrackedOrder(id) {
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     let alive = true;
+    let close = () => {};
     setData(null); setError('');
     const receive = payload => {
       if (!alive) return;
-      if (payload.type === 'not_found') { setError('Order not found, or the scenario was reset.'); return; }
+      if (payload.type === 'not_found') {
+        setError('This order is no longer available after the simulation restarted. Return to the shop to place a new order.');
+        setConnected(false); close(); return;
+      }
+      if (payload.type !== 'tracking') {
+        setError('The backend is running an older version. Restart it and refresh this page.');
+        setConnected(false); close(); return;
+      }
       setData(payload); setReceivedAt(Date.now()); setError('');
     };
-    api.track(id).then(receive).catch(() => { if (alive) setError('Unable to load this order.'); });
-    const close = connectWs(receive, `/ws/track/${encodeURIComponent(id)}`, status => { if (alive) setConnected(status); });
+    api.track(id).then(receive).catch(error => {
+      if (!alive) return;
+      if (error.status === 404) receive({ type: 'not_found' });
+      else setError('Unable to reach the backend. Reconnecting…');
+    });
+    close = connectWs(receive, `/ws/track/${encodeURIComponent(id)}`, status => { if (alive) setConnected(status); });
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => { alive = false; close(); clearInterval(timer); };
   }, [id]);
