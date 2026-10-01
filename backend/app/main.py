@@ -18,6 +18,7 @@ from .dispatch import (
 )
 from . import simulator
 from . import world as world_module
+from .catalog import CATALOG, CATALOG_BY_SKU
 from .world import world
 from .ws import manager
 
@@ -36,8 +37,10 @@ async def seed_db_if_empty():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from .db import auto_migrate
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await auto_migrate(conn)
     await seed_db_if_empty()
     await world_module.load_world()
     _background_tasks.append(asyncio.create_task(simulator.run_forever()))
@@ -81,11 +84,13 @@ async def track_order(order_id: str):
 
     rider_pos = None
     eta_seconds = None
+    rider_name = None
     if order.rider_id:
         rider = world.rider_by_id.get(order.rider_id)
         if rider:
             rider_pos = {"lat": rider.lat, "lng": rider.lng}
             eta_seconds = round(travel_seconds(rider.lat, rider.lng, order.customer_lat, order.customer_lng, rider.speed_kmh), 1)
+            rider_name = rider.name
 
     store_name = world.store_by_id[order.store_id].name if order.store_id in world.store_by_id else None
     stage_index = STAGE_ORDER.index(order.status) if order.status in STAGE_ORDER else -1
@@ -99,10 +104,13 @@ async def track_order(order_id: str):
         "priority": order.priority,
         "store_name": store_name,
         "items": order.items,
+        "customer_name": order.customer_name,
+        "address_label": order.address_label,
         "promised_at": order.promised_at.isoformat(),
         "created_at": order.created_at.isoformat(),
         "delivered_at": order.delivered_at.isoformat() if order.delivered_at else None,
         "rider_position": rider_pos,
+        "rider_name": rider_name,
         "eta_seconds": eta_seconds,
         "customer_location": {"lat": order.customer_lat, "lng": order.customer_lng},
     }
@@ -115,13 +123,61 @@ async def traffic_zones():
 
 @app.get("/catalog")
 async def catalog():
-    return [{"sku": sku, "name": name, "weight_kg": w} for sku, name, w in simulator.SKU_CATALOG]
+    return CATALOG
+
+
+@app.get("/catalog/availability")
+async def catalog_availability(skus: str, customer_lat: float | None = None, customer_lng: float | None = None):
+    """Per store: can it fulfil every requested SKU, how much of each is available, and how far/how
+    long to get there from the customer — the data the storefront's stock-check step highlights."""
+    requested = [s for s in skus.split(",") if s]
+    out = []
+    for store in world.stores:
+        per_item = {}
+        has_all = True
+        for sku in requested:
+            row = world.inventory.get((store.id, sku))
+            available = (row.qty - row.reserved_qty) if row else 0
+            per_item[sku] = available
+            if available <= 0:
+                has_all = False
+        entry = {"store_id": store.id, "store_name": store.name, "has_all_items": has_all, "available": per_item}
+        if customer_lat is not None and customer_lng is not None:
+            from .dispatch import haversine_km, travel_seconds as _travel
+            entry["distance_km"] = round(haversine_km(customer_lat, customer_lng, store.lat, store.lng), 2)
+            entry["eta_seconds"] = round(_travel(store.lat, store.lng, customer_lat, customer_lng, 28.0), 0)
+        out.append(entry)
+    out.sort(key=lambda e: (not e["has_all_items"], e.get("distance_km", 0)))
+    return out
 
 
 @app.get("/dark_stores/{store_id}/inventory")
 async def store_inventory(store_id: str):
     rows = [v for (sid, _sku), v in world.inventory.items() if sid == store_id]
-    return [{"sku": r.sku, "name": r.name, "qty": r.qty, "reserved_qty": r.reserved_qty, "available": r.qty - r.reserved_qty} for r in rows]
+    return [{
+        "sku": r.sku, "name": r.name, "qty": r.qty, "reserved_qty": r.reserved_qty,
+        "available": r.qty - r.reserved_qty,
+        "category": CATALOG_BY_SKU.get(r.sku, {}).get("category"),
+        "emoji": CATALOG_BY_SKU.get(r.sku, {}).get("emoji"),
+        "low_stock": 0 < (r.qty - r.reserved_qty) <= 10,
+        "out_of_stock": (r.qty - r.reserved_qty) <= 0,
+    } for r in rows]
+
+
+class RestockBody(BaseModel):
+    sku: str
+    qty: int = Field(gt=0, le=500)
+
+
+@app.post("/dark_stores/{store_id}/restock")
+async def restock_store(store_id: str, body: RestockBody):
+    key = (store_id, body.sku)
+    row = world.inventory.get(key)
+    if row is None:
+        raise HTTPException(404, "store or sku not found")
+    row.qty += body.qty
+    world.mark_inventory_dirty(key)
+    return {"ok": True, "store_id": store_id, "sku": body.sku, "qty": row.qty, "available": row.qty - row.reserved_qty}
 
 
 @app.get("/riders")
@@ -144,6 +200,7 @@ async def list_orders(status: str | None = None):
         "id": o.id, "lat": o.customer_lat, "lng": o.customer_lng, "status": o.status,
         "priority": o.priority, "risk": o.risk, "store_id": o.store_id, "rider_id": o.rider_id,
         "items": o.items, "weight_kg": o.weight_kg,
+        "customer_name": o.customer_name, "address_label": o.address_label,
         "promised_at": o.promised_at.isoformat(), "created_at": o.created_at.isoformat(),
     } for o in orders[:200]]
 
@@ -161,6 +218,8 @@ class OrderCreate(BaseModel):
     items: list[OrderItemIn]
     priority: bool = False
     promise_minutes: int = Field(default=20, ge=5, le=120)
+    customer_name: str = "Customer"
+    address_label: str = ""
 
 
 @app.post("/orders")
@@ -173,6 +232,7 @@ async def create_order(body: OrderCreate):
     order = Order(
         id=f"ORD-{uuid.uuid4().hex[:8].upper()}",
         customer_lat=body.customer_lat, customer_lng=body.customer_lng,
+        customer_name=body.customer_name or "Customer", address_label=body.address_label,
         items=items, weight_kg=round(weight, 2), priority=body.priority,
         created_at=now, promised_at=now + dt.timedelta(minutes=body.promise_minutes),
         status="created", risk="LOW",

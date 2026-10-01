@@ -16,6 +16,7 @@ import json
 import uuid
 from . import world as world_module
 from .world import world, NON_TERMINAL_STATUSES, ACTIVE_STATUSES
+from .catalog import CATALOG
 from .dispatch import (
     allocate_sync, cheapest_insertion_cost, rolling_reoptimize_sync,
     traffic_multiplier_for_leg, active_traffic_zones,
@@ -33,14 +34,11 @@ state = {
 }
 
 _rng = random.Random(SEED)
-SKU_CATALOG = [
-    ("SKU-MILK", "Milk 1L", 0.5),
-    ("SKU-BREAD", "Bread Loaf", 0.3),
-    ("SKU-EGGS", "Eggs (12)", 0.6),
-    ("SKU-RICE", "Rice 5kg", 5.0),
-    ("SKU-SOAP", "Soap Bar", 0.15),
-    ("SKU-SNACK", "Snack Pack", 0.2),
+DEMO_CUSTOMER_NAMES = [
+    "Aarav Shah", "Priya Nair", "Rohan Mehta", "Isha Kapoor", "Karan Singh",
+    "Ananya Rao", "Vikram Joshi", "Sneha Iyer", "Arjun Desai", "Meera Pillai",
 ]
+AREA_NAMES = ["Andheri West", "Bandra East", "Powai", "Lower Parel", "Dadar", "Kurla", "Vile Parle"]
 
 
 def reset_rng():
@@ -72,10 +70,10 @@ def spawn_order():
     n_items = _rng.randint(1, 3)
     items = []
     weight = 0.0
-    for sku, name, w in _rng.sample(SKU_CATALOG, n_items):
+    for product in _rng.sample(CATALOG, n_items):
         qty = _rng.randint(1, 2)
-        items.append({"sku": sku, "name": name, "qty": qty, "weight_kg": w})
-        weight += w * qty
+        items.append({"sku": product["sku"], "name": product["name"], "qty": qty, "weight_kg": product["weight_kg"]})
+        weight += product["weight_kg"] * qty
     priority = _rng.random() < 0.2
     now = dt.datetime.now(dt.timezone.utc)
     promise_minutes = 12 if priority else _rng.choice([15, 20, 25, 30])
@@ -84,6 +82,8 @@ def spawn_order():
         customer_lat=lat, customer_lng=lng,
         items=items, weight_kg=round(weight, 2),
         priority=priority,
+        customer_name=_rng.choice(DEMO_CUSTOMER_NAMES),
+        address_label=f"Flat {_rng.randint(1,12)}0{_rng.randint(1,9)}, {_rng.choice(AREA_NAMES)}",
         created_at=now,
         promised_at=now + dt.timedelta(minutes=promise_minutes),
         status="created", risk="LOW",

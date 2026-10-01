@@ -51,8 +51,65 @@ async def test_seed_populates_five_dark_stores_and_fifteen_riders(client):
 async def test_catalog_lists_skus(client):
     r = await client.get("/catalog")
     assert r.status_code == 200
-    skus = {c["sku"] for c in r.json()}
+    body = r.json()
+    assert len(body) >= 20  # "about 20 SKUs" with categories/price/emoji
+    skus = {c["sku"] for c in body}
     assert "SKU-MILK" in skus
+    assert all({"category", "price", "emoji", "weight_kg"} <= c.keys() for c in body)
+
+
+async def test_inventory_is_genuinely_uneven_across_stores(client):
+    stores = (await client.get("/dark_stores")).json()
+    availabilities = []
+    for s in stores:
+        inv = (await client.get(f"/dark_stores/{s['id']}/inventory")).json()
+        stocked_skus = {row["sku"] for row in inv if row["available"] > 0}
+        availabilities.append(stocked_skus)
+    # not every store should stock the exact same set — that's the whole point of uneven seeding
+    assert len(set(frozenset(a) for a in availabilities)) > 1
+
+
+async def test_catalog_availability_ranks_stores_with_full_stock_first(client):
+    stores = (await client.get("/dark_stores")).json()
+    inv = (await client.get(f"/dark_stores/{stores[0]['id']}/inventory")).json()
+    stocked_sku = next(row["sku"] for row in inv if row["available"] > 0)
+
+    r = await client.get(f"/catalog/availability?skus={stocked_sku}&customer_lat=19.05&customer_lng=72.84")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body) == 5
+    assert all("has_all_items" in e and "distance_km" in e for e in body)
+    # results sorted so has_all_items stores come before partial ones
+    flags = [e["has_all_items"] for e in body]
+    assert flags == sorted(flags, reverse=True)
+
+
+async def test_restock_increases_available_quantity(client):
+    stores = (await client.get("/dark_stores")).json()
+    store_id = stores[0]["id"]
+    inv_before = (await client.get(f"/dark_stores/{store_id}/inventory")).json()
+    row = inv_before[0]
+
+    r = await client.post(f"/dark_stores/{store_id}/restock", json={"sku": row["sku"], "qty": 50})
+    assert r.status_code == 200
+    assert r.json()["qty"] == row["qty"] + 50
+
+    inv_after = (await client.get(f"/dark_stores/{store_id}/inventory")).json()
+    updated = next(x for x in inv_after if x["sku"] == row["sku"])
+    assert updated["available"] == row["available"] + 50
+
+
+async def test_create_order_carries_customer_name_and_address(client):
+    body = {
+        "customer_lat": 19.05, "customer_lng": 72.84,
+        "items": [{"sku": "SKU-MILK", "name": "Milk 1L", "qty": 1, "weight_kg": 0.5}],
+        "customer_name": "Test Customer", "address_label": "Flat 101, Test Society",
+    }
+    created = (await client.post("/orders", json=body)).json()
+    orders = (await client.get("/orders")).json()
+    match = next(o for o in orders if o["id"] == created["id"])
+    assert match["customer_name"] == "Test Customer"
+    assert match["address_label"] == "Flat 101, Test Society"
 
 
 async def test_create_order_appears_in_order_list(client):

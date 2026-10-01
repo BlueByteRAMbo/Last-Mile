@@ -13,6 +13,10 @@ export const api = {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   }).then(r => r.json()),
   catalog: () => fetch(`${BASE}/catalog`).then(r => r.json()),
+  catalogAvailability: (skus, lat, lng) => fetch(`${BASE}/catalog/availability?skus=${skus.join(',')}${lat != null ? `&customer_lat=${lat}&customer_lng=${lng}` : ''}`).then(r => r.json()),
+  restock: (storeId, sku, qty) => fetch(`${BASE}/dark_stores/${storeId}/restock`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sku, qty }),
+  }).then(r => r.json()),
   kpis: () => fetch(`${BASE}/kpis`).then(r => r.json()),
   disrupt: (kind, target) => fetch(`${BASE}/disruptions/${kind}${target ? `?target=${target}` : ''}`, { method: 'POST' }).then(r => r.json()),
   reset: () => fetch(`${BASE}/reset`, { method: 'POST' }).then(r => r.json()),

@@ -48,6 +48,8 @@ class Order(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True)
     customer_lat: Mapped[float] = mapped_column(Float)
     customer_lng: Mapped[float] = mapped_column(Float)
+    customer_name: Mapped[str] = mapped_column(String, default="Customer")
+    address_label: Mapped[str] = mapped_column(String, default="")
     items: Mapped[list] = mapped_column(JSON)  # [{sku, qty, weight_kg}]
     weight_kg: Mapped[float] = mapped_column(Float, default=1.0)
     priority: Mapped[bool] = mapped_column(Boolean, default=False)

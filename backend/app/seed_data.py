@@ -1,6 +1,7 @@
 import datetime as dt
+import random
 from .models import DarkStore, InventoryItem, Rider
-from .simulator import SKU_CATALOG
+from .catalog import CATALOG
 
 STORES = [
     ("DS-1", "Andheri Hub", 19.1136, 72.8697),
@@ -10,6 +11,12 @@ STORES = [
     ("DS-5", "Dadar Hub", 19.0178, 72.8478),
 ]
 
+# Deterministic (seed 42) but genuinely uneven stock per store: every store carries most of the
+# catalog comfortably, but each one also has a couple of SKUs at zero or near-zero — so which
+# store can actually fulfil a given cart is a real decision, not a formality.
+_inv_rng = random.Random(42)
+STOCK_LEVELS = [0, 0, 3, 8, 40, 80, 150, 200]  # weighted toward well-stocked, with real gaps
+
 
 def build_seed_entities():
     now = dt.datetime.now(dt.timezone.utc)
@@ -17,8 +24,9 @@ def build_seed_entities():
               for i, n, lat, lng in STORES]
     inventory = []
     for s in stores:
-        for sku, name, _w in SKU_CATALOG:
-            inventory.append(InventoryItem(store_id=s.id, sku=sku, name=name, qty=200, reserved_qty=0))
+        for product in CATALOG:
+            qty = _inv_rng.choice(STOCK_LEVELS)
+            inventory.append(InventoryItem(store_id=s.id, sku=product["sku"], name=product["name"], qty=qty, reserved_qty=0))
     riders = []
     for i in range(1, 16):
         store = stores[(i - 1) % len(stores)]
