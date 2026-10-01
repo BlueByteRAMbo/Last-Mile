@@ -14,6 +14,8 @@ export const api = {
   dispatchMode: () => request('/dispatch/mode'),
   setDispatchMode: mode => request('/dispatch/mode', { mode }),
   comparison: () => request('/analytics/comparison'),
+  journey: id => request(`/orders/${encodeURIComponent(id)}/journey`),
+  traffic: body => request(`/disruptions/traffic?${new URLSearchParams(body)}`, {}),
   interveneOrder: async (id, action) => {
     const response = await fetch(`${BASE}/orders/${encodeURIComponent(id)}/intervene/${action}`, { method: 'POST' });
     const body = await response.json();
@@ -27,9 +29,7 @@ export const api = {
   orders: (status) => fetch(`${BASE}/orders${status ? `?status=${status}` : ''}`).then(r => r.json()),
   explainOrder: (id) => fetch(`${BASE}/orders/${id}/explain`).then(r => r.json()),
   track: (id) => fetch(`${BASE}/track/${id}`).then(r => { if (!r.ok) throw new Error('not found'); return r.json(); }),
-  createOrder: (body) => fetch(`${BASE}/orders`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-  }).then(r => r.json()),
+  createOrder: body => request('/orders', body),
   catalog: () => fetch(`${BASE}/catalog`).then(r => r.json()),
   catalogAvailability: (skus, lat, lng) => fetch(`${BASE}/catalog/availability?skus=${skus.join(',')}${lat != null ? `&customer_lat=${lat}&customer_lng=${lng}` : ''}`).then(r => r.json()),
   restock: (storeId, sku, qty) => fetch(`${BASE}/dark_stores/${storeId}/restock`, {
@@ -40,14 +40,16 @@ export const api = {
   reset: () => fetch(`${BASE}/reset`, { method: 'POST' }).then(r => r.json()),
 };
 
-export function connectWs(onMessage) {
+export function connectWs(onMessage, path = '/ws', onStatus = () => {}) {
   let ws;
+  let retry;
   let closedByUs = false;
   const open = () => {
-    ws = new WebSocket(`${WS_BASE}/ws`);
+    ws = new WebSocket(`${WS_BASE}${path}`);
+    ws.onopen = () => onStatus(true);
     ws.onmessage = (ev) => onMessage(JSON.parse(ev.data));
-    ws.onclose = () => { if (!closedByUs) setTimeout(open, 1500); };
+    ws.onclose = () => { onStatus(false); if (!closedByUs) retry = setTimeout(open, 1500); };
   };
   open();
-  return () => { closedByUs = true; ws?.close(); };
+  return () => { closedByUs = true; clearTimeout(retry); ws?.close(); };
 }

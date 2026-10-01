@@ -1,110 +1,20 @@
-import React, { useEffect, useState } from 'react';
-import { Package, CheckCircle2, Circle, AlertTriangle, MapPin, Clock } from 'lucide-react';
-import { api } from '../api';
+import React, { useState } from 'react';
+import useTrackedOrder from '../hooks/useTrackedOrder';
+import JourneyMap from '../components/JourneyMap';
 
-const riskBanner = (risk) => {
-  if (risk === 'SEVERE') return { text: 'This order is significantly delayed.', cls: 'bg-route-red/15 text-route-red border-route-red/30' };
-  if (risk === 'DELAYED') return { text: 'This order is running late.', cls: 'bg-route-red/15 text-route-red border-route-red/30' };
-  if (risk === 'AT_RISK') return { text: 'This order is at risk of missing its promised time.', cls: 'bg-route-amber/15 text-route-amber border-route-amber/30' };
-  return null;
-};
-
-const CustomerTracker = ({ orderId }) => {
-  const [data, setData] = useState(null);
-  const [error, setError] = useState(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    const load = () => api.track(orderId).then(d => { if (!cancelled) { setData(d); setError(null); } })
-      .catch(() => { if (!cancelled) setError('Order not found.'); });
-    load();
-    const t = setInterval(load, 3000);
-    return () => { cancelled = true; clearInterval(t); };
-  }, [orderId]);
-
-  if (error) {
-    return (
-      <div className="w-full h-screen flex items-center justify-center bg-route-base text-white">
-        <div className="text-center">
-          <AlertTriangle className="mx-auto mb-3 text-route-amber" size={32} />
-          <p className="text-slate-300">{error}</p>
-          <p className="text-slate-500 text-sm mt-1">Order ID: {orderId}</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (!data) {
-    return <div className="w-full h-screen flex items-center justify-center bg-route-base text-slate-400">Loading…</div>;
-  }
-
-  const banner = riskBanner(data.risk);
-  const isTerminal = data.status === 'delivered' || data.status === 'cancelled' || data.status === 'failed';
-
-  return (
-    <div className="w-full min-h-screen bg-route-base text-white p-6 flex flex-col items-center">
-      <div className="w-full max-w-md">
-        <div className="mb-6">
-          <div className="text-xs text-slate-500 tracking-wider mb-1">ORDER {data.order_id}</div>
-          <h1 className="text-2xl font-bold">{data.status_label}</h1>
-          {data.priority && <span className="inline-block mt-1 text-xs text-route-cyan">★ Express delivery</span>}
-        </div>
-
-        {banner && (
-          <div className={`mb-5 px-3 py-2 rounded-lg border text-sm flex items-center gap-2 ${banner.cls}`}>
-            <AlertTriangle size={16} /> {banner.text}
-          </div>
-        )}
-
-        {!isTerminal && data.eta_seconds != null && (
-          <div className="mb-6 bg-route-panel/70 border border-white/10 rounded-lg p-4 flex items-center gap-3">
-            <Clock className="text-route-cyan" size={22} />
-            <div>
-              <div className="text-xs text-slate-400">Estimated arrival</div>
-              <div className="text-lg font-bold">{Math.max(0, Math.round(data.eta_seconds / 60))} min</div>
-            </div>
-          </div>
-        )}
-
-        <div className="space-y-0 mb-6">
-          {data.stages.map((stage, i) => (
-            <div key={stage.key} className="flex gap-3">
-              <div className="flex flex-col items-center">
-                {stage.done ? <CheckCircle2 className="text-route-green" size={20} /> : <Circle className="text-slate-600" size={20} />}
-                {i < data.stages.length - 1 && <div className={`w-0.5 flex-1 min-h-[24px] ${stage.done ? 'bg-route-green/50' : 'bg-white/10'}`}></div>}
-              </div>
-              <div className="pb-6">
-                <div className={`text-sm font-medium ${stage.done ? 'text-white' : 'text-slate-500'}`}>{stage.label}</div>
-              </div>
-            </div>
-          ))}
-        </div>
-
-        <div className="bg-route-panel/50 border border-white/10 rounded-lg p-4 space-y-2 text-sm">
-          <div className="flex justify-between text-slate-400">
-            <span className="flex items-center gap-1.5"><Package size={14} /> Items</span>
-            <span className="text-white text-right">{data.items.map(it => `${it.qty}× ${it.name}`).join(', ')}</span>
-          </div>
-          {data.store_name && (
-            <div className="flex justify-between text-slate-400">
-              <span className="flex items-center gap-1.5"><MapPin size={14} /> From</span>
-              <span className="text-white">{data.store_name}</span>
-            </div>
-          )}
-          <div className="flex justify-between text-slate-400">
-            <span>Promised by</span>
-            <span className="text-white">{new Date(data.promised_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-          </div>
-          {data.delivered_at && (
-            <div className="flex justify-between text-slate-400">
-              <span>Delivered at</span>
-              <span className="text-route-green">{new Date(data.delivered_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-};
-
-export default CustomerTracker;
+export default function CustomerTracker({ orderId }) {
+  const { data, error, connected, eta } = useTrackedOrder(orderId);
+  const [follow, setFollow] = useState(true);
+  if (error || !data) return <main className="flow-page p-8"><a href="#shop">← Shop</a><p role="status" className="mt-8">{error || 'Finding your order…'}</p></main>;
+  const terminal = ['delivered', 'failed', 'cancelled'].includes(data.status);
+  const event = data.route_events?.at(-1);
+  return <main className="flow-page customer-page">
+    <header className="flow-header"><a href="#shop" className="flow-brand">ROUTEX <span>YOUR DELIVERY</span></a><span className={connected ? 'text-route-green' : 'text-route-amber'}>{connected ? '● Live updates' : 'Reconnecting… last known status'}</span></header>
+    <div className="journey-heading"><div><p className="flow-eyebrow">{orderId} · {data.customer_name}</p><h1>{data.status === 'delivered' ? 'At your doorstep.' : data.status_label}</h1><p className="text-slate-400 mt-2">{data.address_label}</p></div><div className="customer-eta"><span>{terminal ? 'ORDER STATUS' : 'ESTIMATED ARRIVAL'}</span><strong>{terminal ? data.status_label : eta == null ? 'Finding a rider' : `${Math.floor(eta / 60)}m ${eta % 60}s`}</strong></div></div>
+    {!terminal && data.predicted_late && <div className="customer-banner">Your delivery is taking longer than promised. The estimated arrival is updating live.</div>}
+    {!terminal && event && <div className="customer-banner">{event.message}{eta != null ? ` Estimated arrival in ${Math.ceil(eta / 60)} min.` : ''}</div>}
+    <section className="customer-map"><JourneyMap data={data} customerOnly follow={follow} /><button className="flow-chip selected customer-follow" onClick={() => setFollow(!follow)}>Follow rider {follow ? 'on' : 'off'}</button></section>
+    <div className="customer-details"><section className="flow-card"><p className="flow-eyebrow">EVERY STEP, LIVE</p><h2>Your delivery timeline</h2><ol className="journey-timeline">{data.stages.map(s => <li key={s.key} className={s.done ? 'done' : ''}><div><span>{s.done ? '✓' : '○'} {s.label}</span>{s.detail && <p className="text-xs text-slate-400">{s.detail}{s.key === 'store' ? ' · items confirmed' : ''}</p>}</div><small>{s.ts ? new Date(s.ts).toLocaleTimeString() : 'Pending'}</small></li>)}</ol></section>
+    <section className="flow-card"><p className="flow-eyebrow">YOUR ORDER</p><h2>{data.priority ? 'Express delivery' : 'Everyday essentials'}</h2>{data.items.map((item, i) => <div className="cart-row" key={`${item.sku}-${i}`}><span>{item.name}</span><strong>× {item.qty}</strong></div>)}<p className="text-sm text-slate-400 mt-5">From {data.store_name || 'a nearby store'}<br />{data.rider_name ? `Rider: ${data.rider_name} · ${data.rider_vehicle}` : 'We are finding your rider.'}<br />Promised by {new Date(data.promised_at).toLocaleTimeString()}</p></section></div>
+  </main>;
+}

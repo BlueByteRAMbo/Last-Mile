@@ -23,6 +23,7 @@ from .dispatch import (
 )
 from . import routing
 from .tracking import rider_route, delivery_etas, order_tracking
+from .tracking import stock_check
 from .ws import manager
 
 TICK_SECONDS = 2.0
@@ -97,6 +98,7 @@ def spawn_order():
 
 
 def try_allocate(order, active_orders):
+    order.stock_check = stock_check(order)
     active_by_rider = _group_by(active_orders, ACTIVE_STATUSES, "rider_id")
     decision = allocate_sync(order, world.stores, world.riders, active_by_rider, world.inventory, state["dispatch_mode"])
     if decision["chosen"] is None:
@@ -360,6 +362,7 @@ async def tick():
         for leg in legs:
             asyncio.create_task(routing.ensure_route(*leg))  # fire-and-forget; tick never awaits network I/O
     await manager.broadcast(build_snapshot())
+    await manager.broadcast_tracking()
 
 
 async def run_forever():

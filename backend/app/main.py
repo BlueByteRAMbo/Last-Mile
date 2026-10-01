@@ -77,7 +77,7 @@ async def dispatch_comparison():
     from .comparison import comparison
     try:
         return await comparison()
-    except (RuntimeError, asyncio.TimeoutError):
+    except (RuntimeError, OSError, asyncio.TimeoutError):
         raise HTTPException(503, 'Comparison could not finish; please retry')
 
 
@@ -104,45 +104,42 @@ STAGE_LABELS = {
 
 @app.get("/track/{order_id}")
 async def track_order(order_id: str):
-    """Customer-safe view: no internal scoring/cost data, just lifecycle + live ETA + rider position."""
+    from .tracking import customer_snapshot
     order = world.orders.get(order_id)
     if order is None:
-        raise HTTPException(404, "order not found")
+        raise HTTPException(404, 'order not found')
+    return customer_snapshot(order)
 
-    rider_pos = None
-    rider_name = None
-    if order.rider_id:
-        rider = world.rider_by_id.get(order.rider_id)
-        if rider:
-            rider_pos = {"lat": rider.lat, "lng": rider.lng}
-            rider_name = rider.name
 
-    store_name = world.store_by_id[order.store_id].name if order.store_id in world.store_by_id else None
-    stage_index = STAGE_ORDER.index(order.status) if order.status in STAGE_ORDER else -1
+@app.websocket('/ws/track/{order_id}')
+async def tracking_socket(websocket: WebSocket, order_id: str):
+    await websocket.accept()
+    if order_id not in world.orders:
+        await websocket.send_json({'type': 'not_found'})
+        await websocket.close(code=1008)
+        return
+    manager.tracking[websocket] = order_id
+    try:
+        await websocket.send_json(await track_order(order_id))
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        manager.disconnect(websocket)
 
-    return {
-        "order_id": order.id,
-        "status": order.status,
-        "status_label": STAGE_LABELS.get(order.status, order.status),
-        "stages": [{"key": s, "label": STAGE_LABELS[s], "done": i <= stage_index} for i, s in enumerate(STAGE_ORDER)],
-        "risk": order.risk,
-        "priority": order.priority,
-        "store_name": store_name,
-        "items": order.items,
-        "customer_name": order.customer_name,
-        "address_label": order.address_label,
-        "promised_at": order.promised_at.isoformat(),
-        "created_at": order.created_at.isoformat(),
-        "delivered_at": order.delivered_at.isoformat() if order.delivered_at else None,
-        "rider_position": rider_pos,
-        "rider_name": rider_name,
-        **{key: value for key, value in order_tracking(order, delivery_etas(world.active_orders()), dt.datetime.now(dt.timezone.utc)).items()
-           if key != "priority_score"},
-        **(tracking_rider_route(world.rider_by_id[order.rider_id])
-           if order.rider_id in world.rider_by_id and order.status in ("assigned", "packing", "packed", "out_for_delivery")
-           else {"polyline_remaining": [], "route_version": None, "heading": None, "approximate_route": True}),
-        "customer_location": {"lat": order.customer_lat, "lng": order.customer_lng},
-    }
+
+@app.get('/orders/{order_id}/journey')
+async def order_journey(order_id: str):
+    from .tracking import stock_check
+    order = world.orders.get(order_id)
+    if order is None:
+        raise HTTPException(404, 'order not found')
+    decision = json.loads(order.assignment_reason) if order.assignment_reason else {}
+    return {'stock_check': order.stock_check or stock_check(order),
+            'decision': decision,
+            'route_history': [{'type': e.type, 'ts': e.ts.isoformat(), **(e.payload or {})}
+                              for e in world.events if e.order_id == order_id and e.type in ('ROUTE_CHANGED', 'ROUTE_KEPT')]}
 
 
 @app.get("/traffic_zones")
@@ -312,18 +309,18 @@ async def intervene_order(order_id: str, action: str):
 class OrderItemIn(BaseModel):
     sku: str
     name: str
-    qty: int = 1
-    weight_kg: float = 0.3
+    qty: int = Field(default=1, ge=1, le=20)
+    weight_kg: float = Field(default=0.3, gt=0)
 
 
 class OrderCreate(BaseModel):
-    customer_lat: float
-    customer_lng: float
-    items: list[OrderItemIn]
+    customer_lat: float = Field(ge=-90, le=90)
+    customer_lng: float = Field(ge=-180, le=180)
+    items: list[OrderItemIn] = Field(min_length=1, max_length=30)
     priority: bool = False
     promise_minutes: int = Field(default=20, ge=5, le=120)
-    customer_name: str = "Customer"
-    address_label: str = ""
+    customer_name: str = Field(default="Customer", max_length=100)
+    address_label: str = Field(default="", max_length=250)
 
 
 @app.post("/orders")
@@ -331,6 +328,11 @@ async def create_order(body: OrderCreate):
     """Customer-facing order placement. Written straight into world state so the very next tick
     can allocate it — no DB round trip on the request path."""
     items = [it.model_dump() for it in body.items]
+    for item in items:
+        product = CATALOG_BY_SKU.get(item['sku'])
+        if product is None:
+            raise HTTPException(422, 'Unknown catalog item')
+        item['name'], item['weight_kg'] = product['name'], product['weight_kg']
     weight = sum(it["qty"] * it["weight_kg"] for it in items)
     now = dt.datetime.now(dt.timezone.utc)
     order = Order(
@@ -342,6 +344,8 @@ async def create_order(body: OrderCreate):
         status="created", risk="LOW",
     )
     world.add_new_order(order)
+    from .tracking import stock_check
+    order.stock_check = stock_check(order)
     world.log_event(order.id, "ORDER_CREATED", {"priority": body.priority, "source": "api"})
     return {"id": order.id, "status": order.status}
 
@@ -416,10 +420,8 @@ async def explain_order(order_id: str):
     if decision.get("chosen") and decision.get("alternatives"):
         chosen_vs_runner_up = round(decision["alternatives"][0]["cost"] - decision["chosen"]["cost"], 2)
 
-    events = []
-    async with SessionLocal() as session:
-        rows = (await session.execute(select(OrderEvent).where(OrderEvent.order_id == order_id).order_by(OrderEvent.ts))).scalars().all()
-        events = [{"type": e.type, "ts": e.ts.isoformat(), "payload": e.payload} for e in rows]
+    events = [{"type": e.type, "ts": e.ts.isoformat() if e.ts else None, "payload": e.payload}
+              for e in world.events if e.order_id == order_id]
 
     return {
         "order_id": order_id,
@@ -451,25 +453,32 @@ async def evaluate_reroute(rider, zone) -> dict:
     the cached route in place only if the gain clears the threshold; otherwise explicitly reports
     "kept current route" so that outcome is just as visible as a switch."""
     current_route = routing.get_cached_route(rider.nav_origin_lat, rider.nav_origin_lng, rider.nav_target_lat, rider.nav_target_lng)
-    current_polyline = current_route["polyline"] if current_route else [
-        [rider.nav_origin_lng, rider.nav_origin_lat], [rider.nav_target_lng, rider.nav_target_lat]]
+    current_polyline = tracking_rider_route(rider)['polyline_remaining']
     current_duration = estimate_zone_adjusted_duration(current_polyline, rider.speed_kmh, zone)
-
+    start_state = (rider.lat, rider.lng, rider.nav_target_lat, rider.nav_target_lng)
     alternatives = await routing.fetch_alternatives(rider.lat, rider.lng, rider.nav_target_lat, rider.nav_target_lng)
+    if start_state != (rider.lat, rider.lng, rider.nav_target_lat, rider.nav_target_lng) or world.rider_by_id.get(rider.id) is not rider:
+        return {'switched': False, 'gain_seconds': 0, 'reason': 'Rider moved while routes were fetched; keeping live route'}
+    if current_route and not current_route.get('approximate', False):
+        alternatives = [r for r in alternatives if not r.get('approximate', False)]
+    if not alternatives:
+        return {'switched': False, 'gain_seconds': 0, 'reason': 'Road routing unavailable; keeping current route'}
     scored = [(estimate_zone_adjusted_duration(r["polyline"], rider.speed_kmh, zone), r) for r in alternatives]
     best_duration, best_route = min(scored, key=lambda x: x[0])
 
     gain = current_duration - best_duration
     threshold = max(REROUTE_GAIN_THRESHOLD_SECONDS, REROUTE_GAIN_THRESHOLD_PCT * current_duration)
+    details = {'gain_seconds': round(gain, 1), 'old_eta_seconds': round(current_duration, 1),
+               'new_eta_seconds': round(best_duration, 1), 'old_polyline': current_polyline,
+               'candidate_polyline': best_route['polyline'], 'threshold_seconds': round(threshold, 1)}
     if gain >= threshold:
         new_key = routing._key(rider.lat, rider.lng, rider.nav_target_lat, rider.nav_target_lng)
         routing._store(new_key, best_route)
         rider.nav_origin_lat, rider.nav_origin_lng = rider.lat, rider.lng  # new leg starts from here, not the old origin
         rider.route_progress_km = 0.0
         world.mark_rider_dirty(rider.id)
-        return {"switched": True, "gain_seconds": round(gain, 1),
-                "old_eta_seconds": round(current_duration, 1), "new_eta_seconds": round(best_duration, 1)}
-    return {"switched": False, "gain_seconds": round(gain, 1), "reason": "kept current route — gain below threshold"}
+        return {"switched": True, **details}
+    return {"switched": False, **details, "reason": "kept current route — gain below threshold"}
 
 
 @app.post("/disruptions/{kind}")

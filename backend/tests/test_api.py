@@ -137,6 +137,111 @@ async def test_comparison_endpoint_does_not_touch_live_orders(client, monkeypatc
     assert world.orders[order.id] is order
 
 
+async def test_journey_preserves_quantity_aware_stock_check_and_customer_timeline(client):
+    order = await intervention_order(client)
+    store = world.stores[0]
+    world.inventory[(store.id, 'SKU-MILK')].qty = 1
+    world.inventory[(store.id, 'SKU-MILK')].reserved_qty = 0
+    order.items[0]['qty'] = 2
+    simulator_module.try_allocate(order, world.active_orders())
+    journey = (await client.get(f'/orders/{order.id}/journey')).json()
+    unavailable = next(s for s in journey['stock_check'] if s['store_id'] == store.id)
+    assert unavailable['has_all_items'] is False
+    assert unavailable['missing'] == ['SKU-MILK']
+    track = (await client.get(f'/track/{order.id}')).json()
+    assert track['stages'][0]['ts']
+    assert 'cost' not in str(track)
+    assert 'decision' not in track
+    assert 'priority_score' not in track
+    assert (await client.get('/orders/missing/journey')).status_code == 404
+
+
+async def test_customer_tracking_broadcast_contains_delivery_and_no_internal_scores(client):
+    from app.ws import manager
+    order = await intervention_order(client)
+    messages = []
+    class Socket:
+        async def send_json(self, message):
+            messages.append(message)
+    socket = Socket()
+    manager.tracking[socket] = order.id
+    try:
+        order.status = 'delivered'
+        order.delivered_at = dt.datetime.now(dt.timezone.utc)
+        world.log_event(order.id, 'DELIVERED')
+        await manager.broadcast_tracking()
+        assert messages[-1]['status'] == 'delivered'
+        assert messages[-1]['eta_seconds'] == 0
+        assert messages[-1]['stages'][-1]['done']
+        assert 'priority_score' not in messages[-1]
+        world.orders.pop(order.id)
+        await manager.broadcast_tracking()
+        assert messages[-1]['type'] == 'not_found'
+    finally:
+        manager.disconnect(socket)
+
+
+async def test_checkout_validates_quantity_and_uses_catalog_weight(client):
+    body = {'customer_lat': 19.1, 'customer_lng': 72.8,
+            'items': [{'sku': 'SKU-MILK', 'name': 'Spoofed', 'qty': 0, 'weight_kg': .01}]}
+    assert (await client.post('/orders', json=body)).status_code == 422
+    body['items'][0]['qty'] = 1
+    response = await client.post('/orders', json=body)
+    from app.catalog import CATALOG_BY_SKU
+    order = world.orders[response.json()['id']]
+    assert order.weight_kg == CATALOG_BY_SKU['SKU-MILK']['weight_kg']
+    assert order.items[0]['name'] == CATALOG_BY_SKU['SKU-MILK']['name']
+    body['items'][0]['sku'] = 'missing'
+    assert (await client.post('/orders', json=body)).status_code == 422
+
+
+async def test_reroute_uses_remaining_leg_and_rejects_stale_fetch(client, monkeypatch):
+    from app import routing
+    rider = world.riders[0]
+    rider.nav_origin_lat, rider.nav_origin_lng = 19, 72.8
+    rider.nav_target_lat, rider.nav_target_lng = 19, 72.9
+    rider.route_progress_km = 9
+    rider.lat, rider.lng = routing.polyline_progress_point([[72.8, 19], [72.9, 19]], 9)
+    async def alternatives(*args):
+        rider.nav_target_lng = 72.95
+        return [{'polyline': [[72.8, 19], [72.9, 19]], 'approximate': False}]
+    monkeypatch.setattr(routing, 'fetch_alternatives', alternatives)
+    response = await main_module.evaluate_reroute(rider, {'lat': 19, 'lng': 72.81, 'radius_km': .1, 'multiplier': .1})
+    assert response['switched'] is False
+    assert 'moved' in response['reason']
+    assert rider.nav_target_lng == 72.95
+
+
+async def test_reroute_does_not_count_already_travelled_distance_as_a_gain(client, monkeypatch):
+    from app import routing
+    from app.tracking import rider_route
+    rider = world.riders[0]
+    rider.nav_origin_lat, rider.nav_origin_lng = 19, 72.8
+    rider.nav_target_lat, rider.nav_target_lng = 19, 72.9
+    rider.route_progress_km = 9
+    points = [[72.8, 19], [72.9, 19]]
+    rider.lat, rider.lng = routing.polyline_progress_point(points, 9)
+    routing._store(routing._key(19, 72.8, 19, 72.9), {'polyline': points, 'approximate': False})
+    remaining = rider_route(rider)['polyline_remaining']
+    async def same_remaining_route(*args):
+        return [{'polyline': remaining, 'approximate': False}]
+    monkeypatch.setattr(routing, 'fetch_alternatives', same_remaining_route)
+    result = await main_module.evaluate_reroute(rider, {'lat': 20, 'lng': 74, 'radius_km': .1, 'multiplier': .1})
+    assert result['switched'] is False
+    assert result['gain_seconds'] == 0
+    assert result['old_polyline'][0] == remaining[0]
+
+
+async def test_stock_evidence_survives_persistence(client):
+    order = await intervention_order(client)
+    expected = order.stock_check
+    assert expected
+    await world_module.persist_once()
+    await world_module.load_world()
+    assert world.orders[order.id].stock_check == expected
+    assert all(r.vehicle == 'Delivery bike' for r in world.riders)
+
+
 @pytest_asyncio.fixture
 async def client(monkeypatch):
     """Spin up the real FastAPI app against an isolated in-memory DB, with the background

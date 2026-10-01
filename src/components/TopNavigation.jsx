@@ -19,10 +19,10 @@ const TopNavigation = ({ liveOperations, setLiveOperations, activeTab, onTabChan
 
       {/* Nav Links */}
       <div className="hidden md:flex items-center gap-6 pointer-events-auto bg-route-base/80 backdrop-blur-md px-6 py-3 rounded-full border border-white/5 shadow-lg">
-        {['Overview', 'Orders', 'Riders', 'Dark Stores', 'Optimization', 'Simulation', 'Analytics'].map(tab => (
+        {['Overview', 'Orders', 'Riders', 'Dark Stores', 'Optimization', 'Analytics', 'Shop'].map(tab => (
           <button
             key={tab}
-            onClick={() => onTabChange(tab)}
+            onClick={() => tab === 'Shop' ? window.location.hash = 'shop' : onTabChange(tab)}
             className={`text-sm font-medium transition-colors whitespace-nowrap ${activeTab === tab ? 'text-route-cyan' : 'text-slate-400 hover:text-white'}`}>
             {tab}
           </button>

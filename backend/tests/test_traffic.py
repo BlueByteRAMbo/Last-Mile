@@ -1,5 +1,23 @@
 import datetime as dt
 import pytest
+
+
+async def test_traffic_on_road_detour_affects_rider_even_outside_direct_line():
+    from app import routing
+    from app.dispatch import riders_affected_by_zone_sync
+    from .conftest import make_rider, make_order
+    rider = make_rider(lat=19, lng=72.8)
+    rider.nav_origin_lat, rider.nav_origin_lng = 19, 72.8
+    rider.nav_target_lat, rider.nav_target_lng = 19, 72.82
+    points = [[72.8, 19], [72.81, 19.02], [72.82, 19]]
+    routing._store(routing._key(19, 72.8, 19, 72.82), {'polyline': points, 'approximate': False})
+    order = make_order(lat=19, lng=72.82)
+    order.rider_id, order.status = rider.id, 'out_for_delivery'
+    try:
+        affected = riders_affected_by_zone_sync({'lat': 19.02, 'lng': 72.81, 'radius_km': .1}, [rider], [order])
+        assert affected == [rider.id]
+    finally:
+        routing.clear_cache()
 from app.dispatch import (
     add_traffic_zone, clear_traffic_zones, traffic_multiplier_for_leg,
     riders_affected_by_zone, travel_seconds,

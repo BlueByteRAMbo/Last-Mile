@@ -16,7 +16,7 @@ import useLiveOps from '../hooks/useLiveOps';
 // Heaviest two screens (recharts, and the GLB/3D simulation machinery) split out of the main
 // bundle — most sessions never open either tab, so there's no reason to ship them up front.
 const AnalyticsPanel = lazy(() => import('../components/panels/AnalyticsPanel'));
-const RiderSimulation = lazy(() => import('../components/simulation/RiderSimulation'));
+
 
 const PanelLoading = () => (
   <div className="absolute top-40 left-6 z-10 text-xs text-slate-500 bg-route-panel/95 backdrop-blur-md rounded-lg border border-white/10 px-4 py-3">
@@ -28,7 +28,7 @@ const OperationsMap = () => {
   const [selectedEntity, setSelectedEntity] = useState(null);
   const [liveOperations, setLiveOperations] = useState(true);
   const [activeTab, setActiveTab] = useState('Overview');
-  const [mapInstance, setMapInstance] = useState(null);
+
   const live = useLiveOps();
 
   const handleEntitySelect = (entity) => {
@@ -47,7 +47,7 @@ const OperationsMap = () => {
     if (window.mapAPI) window.mapAPI.resetView();
   };
 
-  const isSimulation = activeTab === 'Simulation';
+  const isSimulation = false;
 
   return (
     <div className="relative w-full h-full bg-route-base">
@@ -65,7 +65,6 @@ const OperationsMap = () => {
         onEntitySelect={handleEntitySelect}
         liveOperations={liveOperations}
         simulationMode={isSimulation}
-        onMapLoad={setMapInstance}
         darkStores={live.darkStores}
         riders={live.riders}
         orders={live.orders}
@@ -73,12 +72,6 @@ const OperationsMap = () => {
         demandZones={live.kpis?.zone_density || []}
         showDemandHeatmap={activeTab === 'Analytics'}
       />
-
-      {isSimulation && mapInstance && (
-        <Suspense fallback={<PanelLoading />}>
-          <RiderSimulation map={mapInstance} />
-        </Suspense>
-      )}
 
       {activeTab === 'Orders' && <OrdersPanel orders={live.orders} onSelect={handleEntitySelect} />}
       {activeTab === 'Riders' && <RidersPanel riders={live.riders} onSelect={handleEntitySelect} />}

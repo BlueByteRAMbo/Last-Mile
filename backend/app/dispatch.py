@@ -313,6 +313,15 @@ def allocate_sync(order: Order, stores, riders, active_by_rider, inventory_map, 
     feasible = [c for c in candidates if c["feasible"]]
     if mode == "nearest":
         feasible.sort(key=lambda c: (c["reason"]["pickup_eta_seconds"], c["store_id"], c["rider_id"]))
+    elif feasible and stores:
+        from .routing import get_cached_route
+        eligible_ids = {c['store_id'] for c in feasible}
+        def store_eta(store):
+            cached = get_cached_route(store.lat, store.lng, order.customer_lat, order.customer_lng)
+            eta = cached['duration_s'] if cached else travel_seconds(store.lat, store.lng, order.customer_lat, order.customer_lng, 28)
+            return eta, store.id
+        nearest_store = min((s for s in stores if s.id in eligible_ids), key=store_eta)
+        feasible = [c for c in feasible if c['store_id'] == nearest_store.id]
     if not feasible:
         return {"chosen": None, "alternatives": [], "all_count": len(candidates),
                 "suggestion": suggest_split_fulfillment(order, stores, inventory_map)}
@@ -463,7 +472,10 @@ def riders_affected_by_zone_sync(zone: dict, riders: list[Rider], active_orders:
         stops = by_rider.get(rider.id)
         if not stops:
             continue
-        points = [(rider.lat, rider.lng)] + [(o.customer_lat, o.customer_lng) for o in sorted(stops, key=lambda x: x.route_seq or 0)]
+        from .tracking import rider_route
+        road = rider_route(rider)['polyline_remaining']
+        points = [(lat, lng) for lng, lat in road] if road else [(rider.lat, rider.lng)]
+        points += [(o.customer_lat, o.customer_lng) for o in sorted(stops, key=lambda x: x.route_seq or 0)]
         for (lat1, lng1), (lat2, lng2) in zip(points, points[1:]):
             if _segment_intersects_zone(lat1, lng1, lat2, lng2, zone):
                 affected.append(rider.id)

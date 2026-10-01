@@ -32,6 +32,7 @@ class Rider(Base):
     __tablename__ = "riders"
     id: Mapped[str] = mapped_column(String, primary_key=True)
     name: Mapped[str] = mapped_column(String)
+    vehicle: Mapped[str] = mapped_column(String, default="Delivery bike")
     lat: Mapped[float] = mapped_column(Float)
     lng: Mapped[float] = mapped_column(Float)
     home_store_id: Mapped[str] = mapped_column(ForeignKey("dark_stores.id"))
@@ -77,6 +78,7 @@ class Order(Base):
     delivered_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     failed_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     assignment_reason: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON explain payload
+    stock_check: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
 
 class OrderEvent(Base):

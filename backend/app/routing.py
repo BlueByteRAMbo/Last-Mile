@@ -91,7 +91,7 @@ async def ensure_route(lat1, lng1, lat2, lng2):
         if routes:
             _store(key, routes[0])
     except Exception as e:
-        print(f"[routing] directions fetch failed, staying on haversine fallback: {e}")
+        print(f"[routing] directions fetch failed, staying on haversine fallback: {type(e).__name__}")
     finally:
         _in_flight.discard(key)
 
@@ -99,12 +99,14 @@ async def ensure_route(lat1, lng1, lat2, lng2):
 async def fetch_alternatives(lat1, lng1, lat2, lng2) -> list[dict]:
     """Used for the reroute-around-traffic decision (Phase 3D) — awaited directly (not fired as a
     background task) since it's only called from a disruption-response code path, not every tick."""
+    if not MAPBOX_TOKEN:
+        return [_fallback_route(lat1, lng1, lat2, lng2)]
     try:
         routes = await _fetch_from_mapbox(lat1, lng1, lat2, lng2, alternatives=True)
         if routes:
             return routes
     except Exception as e:
-        print(f"[routing] alternatives fetch failed: {e}")
+        print(f"[routing] alternatives fetch failed: {type(e).__name__}")
     return [_fallback_route(lat1, lng1, lat2, lng2)]
 
 
