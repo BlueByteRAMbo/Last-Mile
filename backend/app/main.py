@@ -110,7 +110,7 @@ async def dispatch_comparison():
     try:
         return await comparison()
     except (RuntimeError, OSError, asyncio.TimeoutError):
-        raise HTTPException(503, 'Comparison could not finish; please retry')
+        raise HTTPException(503, 'Comparison could not finish; please retry') from None
 
 
 @app.get("/dark_stores")

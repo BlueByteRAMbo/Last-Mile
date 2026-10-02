@@ -40,7 +40,7 @@ class Rider(Base):
     current_load_kg: Mapped[float] = mapped_column(Float, default=0.0)
     speed_kmh: Mapped[float] = mapped_column(Float, default=28.0)
     battery_pct: Mapped[float] = mapped_column(Float, default=100.0)
-    status: Mapped[str] = mapped_column(String, default="AVAILABLE")  # AVAILABLE/ON_DELIVERY/OFFLINE
+    status: Mapped[str] = mapped_column(String, default="AVAILABLE")  # AVAILABLE / PICKING_UP / ON_DELIVERY / OFFLINE
     shift_end: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
     busy_seconds: Mapped[float] = mapped_column(Float, default=0.0)
     observed_shift_seconds: Mapped[float] = mapped_column(Float, default=0.0)
@@ -66,11 +66,10 @@ class Order(Base):
     priority: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     promised_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
-    status: Mapped[str] = mapped_column(String, default="created")
+    status: Mapped[str] = mapped_column(String, default="created", index=True)
     store_id: Mapped[str | None] = mapped_column(ForeignKey("dark_stores.id"), nullable=True)
-    rider_id: Mapped[str | None] = mapped_column(ForeignKey("riders.id"), nullable=True)
+    rider_id: Mapped[str | None] = mapped_column(ForeignKey("riders.id"), nullable=True, index=True)
     route_seq: Mapped[int | None] = mapped_column(Integer, nullable=True)  # stop position in rider's route
-    eta: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     risk: Mapped[str] = mapped_column(String, default="LOW")  # LOW/AT_RISK/DELAYED/SEVERE
     assigned_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     packed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -84,7 +83,7 @@ class Order(Base):
 class OrderEvent(Base):
     __tablename__ = "order_events"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    order_id: Mapped[str] = mapped_column(ForeignKey("orders.id"))
+    order_id: Mapped[str] = mapped_column(ForeignKey("orders.id"), index=True)
     type: Mapped[str] = mapped_column(String)
     ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     payload: Mapped[dict] = mapped_column(JSON, default=dict)

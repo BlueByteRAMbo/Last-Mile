@@ -1,7 +1,13 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { Activity } from 'lucide-react';
 import TrackOrderWidget from './TrackOrderWidget';
 import SpeedSelector from './SpeedSelector';
+
+const Clock = () => {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => { const t = setInterval(() => setNow(new Date()), 30000); return () => clearInterval(t); }, []);
+  return <div className="text-sm text-slate-500 hidden lg:block">{now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>;
+};
 
 const TopNavigation = ({ liveOperations, setLiveOperations, activeTab, onTabChange }) => {
   return (
@@ -52,7 +58,7 @@ const TopNavigation = ({ liveOperations, setLiveOperations, activeTab, onTabChan
         <TrackOrderWidget />
         <div className="w-px h-4 bg-white/10"></div>
         <div className="text-sm font-medium text-slate-300 hidden lg:block">Mumbai</div>
-        <div className="text-sm text-slate-500 hidden lg:block">{new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>
+        <Clock />
       </div>
       <div className="absolute top-32 md:top-20 right-3 md:right-6 pointer-events-auto">
         <SpeedSelector />

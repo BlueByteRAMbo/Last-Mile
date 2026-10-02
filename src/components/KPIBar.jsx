@@ -7,7 +7,7 @@ const KPIBar = ({ kpis, orders = [], riders = [] }) => {
   const items = [
     { label: 'ACTIVE ORDERS', value: String(orders.length), highlight: false },
     { label: 'AT RISK', value: String(atRisk), highlight: atRisk > 0 },
-    { label: 'ACTIVE RIDERS', value: String(activeRiders), highlight: false },
+    { label: 'RIDERS ONLINE', value: String(activeRiders), highlight: false },
     { label: 'AVG DELIVERY', value: kpis?.avg_delivery_minutes != null ? `${kpis.avg_delivery_minutes}m` : '—', highlight: false },
     { label: 'ON-TIME', value: kpis?.on_time_rate_pct != null ? `${kpis.on_time_rate_pct}%` : '—', highlight: false },
   ];

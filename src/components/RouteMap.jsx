@@ -99,7 +99,7 @@ function buildRiderEl(rider, orders) {
 
 // Real backend state drives every marker: dark stores, riders (from /riders + WS ticks) and
 // orders (with live risk/priority) replace the old static mock data + random-walk animation.
-const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [], riderDetail = null, demandZones = [], showDemandHeatmap = false, simulationMode, onMapLoad }) => {
+const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [], riderDetail = null, demandZones = [], showDemandHeatmap = false, onMapLoad }) => {
   const mapContainer = useRef(null);
   const map = useRef(null);
   const [mapReady, setMapReady] = useState(false);
@@ -107,6 +107,10 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
   const storeMarkers = useRef([]);
   const riderMarkers = useRef(new Map()); // id -> {marker, el}
   const orderMarkers = useRef(new Map());
+  const onSelectRef = useRef(onEntitySelect);
+  const onMapLoadRef = useRef(onMapLoad);
+  onSelectRef.current = onEntitySelect;  // latest callbacks without re-running the marker effects on every parent render
+  onMapLoadRef.current = onMapLoad;
   const ridersRef = useRef(riders);
   const ordersRef = useRef(orders);
   ridersRef.current = riders;
@@ -124,15 +128,17 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
     map.current.on('style.load', () => {
       map.current.setConfigProperty('basemap', 'theme', 'night');
       setMapReady(true);
-      if (onMapLoad) onMapLoad(map.current);
+      onMapLoadRef.current?.(map.current);
     });
+    const riderEntries = riderMarkers.current;  // refs are stable Maps; capture so cleanup uses the same ones
+    const orderEntries = orderMarkers.current;
     return () => {
       storeMarkers.current.forEach(m => m.remove());
-      riderMarkers.current.forEach(e => e.marker.remove());
-      orderMarkers.current.forEach(e => e.marker.remove());
+      riderEntries.forEach(e => e.marker.remove());
+      orderEntries.forEach(e => e.marker.remove());
       storeMarkers.current = [];
-      riderMarkers.current.clear();
-      orderMarkers.current.clear();
+      riderEntries.clear();
+      orderEntries.clear();
       fittedStores.current = false;
       setMapReady(false);
       map.current?.remove();
@@ -238,7 +244,6 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
     if (!m || !mapReady) return;
     storeMarkers.current.forEach(mk => mk.remove());
     storeMarkers.current = [];
-    if (simulationMode) return;
     darkStores.forEach(store => {
       const el = document.createElement('div');
       el.className = 'cursor-pointer ops-store-marker';
@@ -253,7 +258,7 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
       el.append(icon);
       el.addEventListener('click', (e) => {
         e.stopPropagation();
-        onEntitySelect({ type: 'DARK_STORE', id: store.id, name: store.name, data: store });
+        onSelectRef.current({ type: 'DARK_STORE', id: store.id, name: store.name, data: store });
         m.flyTo({ center: [store.lng, store.lat], zoom: 15, pitch: 45, speed: 1.2, curve: 1.42 });
       });
       storeMarkers.current.push(new mapboxgl.Marker(el).setLngLat([store.lng, store.lat]).addTo(m));
@@ -264,12 +269,12 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
       m.fitBounds(bounds, { padding: 90, maxZoom: 13, duration: 600 });
       fittedStores.current = true;
     }
-  }, [darkStores, simulationMode, mapReady]);
+  }, [darkStores, mapReady]);
 
   // Rider markers — update in-place each tick, rebuild DOM only when status changes
   useEffect(() => {
     const m = map.current;
-    if (!m || !mapReady || simulationMode) return;
+    if (!m || !mapReady) return;
     const seen = new Set();
     riders.forEach(rider => {
       seen.add(rider.id);
@@ -281,7 +286,7 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
         el.addEventListener('click', (e) => {
           e.stopPropagation();
           const cur = ridersRef.current.find(r => r.id === rider.id) || rider;
-          onEntitySelect({ type: 'RIDER', id: cur.id, name: cur.name, data: cur });
+          onSelectRef.current({ type: 'RIDER', id: cur.id, name: cur.name, data: cur });
           m.flyTo({ center: [cur.lng, cur.lat], zoom: 14.5, pitch: 40, speed: 1.2, curve: 1.42 });
         });
         const marker = new mapboxgl.Marker(el).setLngLat([rider.lng, rider.lat]).addTo(m);
@@ -323,12 +328,12 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
     for (const [id, entry] of riderMarkers.current) {
       if (!seen.has(id)) { entry.marker.remove(); riderMarkers.current.delete(id); }
     }
-  }, [riders, simulationMode, mapReady]);
+  }, [riders, mapReady]);
 
   // Order markers — colored by risk, pulsing when at-risk/severe
   useEffect(() => {
     const m = map.current;
-    if (!m || !mapReady || simulationMode) return;
+    if (!m || !mapReady) return;
     const seen = new Set();
     orders.forEach(order => {
       seen.add(order.id);
@@ -339,7 +344,7 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
         el.addEventListener('click', (e) => {
           e.stopPropagation();
           const cur = ordersRef.current.find(o => o.id === order.id) || order;
-          onEntitySelect({ type: 'ORDER', id: cur.id, name: `Order ${cur.id}`, data: cur });
+          onSelectRef.current({ type: 'ORDER', id: cur.id, name: `Order ${cur.id}`, data: cur });
           m.flyTo({ center: [cur.lng, cur.lat], zoom: 16, pitch: 60, speed: 1.2, curve: 1.42 });
         });
         const marker = new mapboxgl.Marker(el).setLngLat([order.lng, order.lat]).addTo(m);
@@ -353,7 +358,7 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
     for (const [id, entry] of orderMarkers.current) {
       if (!seen.has(id)) { entry.marker.remove(); orderMarkers.current.delete(id); }
     }
-  }, [orders, simulationMode, mapReady]);
+  }, [orders, mapReady]);
 
   useEffect(() => {
     if (map.current) {

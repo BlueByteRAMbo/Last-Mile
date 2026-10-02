@@ -24,7 +24,8 @@ export default function JourneyMap({ data, stores = [], riders = [], shortlist =
     m.addControl(new mapboxgl.NavigationControl(), 'bottom-right');
     const resize = new ResizeObserver(() => m.resize());
     resize.observe(container.current);
-    return () => { resize.disconnect(); cancelAnimationFrame(frame.current); markers.current.forEach(entry => entry.marker.remove()); markers.current.clear(); m.remove(); map.current = null; };
+    const markerEntries = markers.current;
+    return () => { resize.disconnect(); cancelAnimationFrame(frame.current); markerEntries.forEach(entry => entry.marker.remove()); markerEntries.clear(); m.remove(); map.current = null; };
   }, [token]);
 
   useEffect(() => {

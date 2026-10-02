@@ -60,3 +60,10 @@ async def auto_migrate(conn):
                 elif isinstance(val, (int, float)):
                     default_sql = f" DEFAULT {val}"
             await conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{col.name}" {sql_type}{default_sql}'))
+
+    # create_all only builds indexes for brand-new tables; add any declared index an existing table lacks
+    for table in Base.metadata.sorted_tables:
+        if table.name not in existing:
+            continue  # brand-new tables got their indexes from create_all
+        for index in table.indexes:
+            await conn.run_sync(lambda sync_conn, index=index: index.create(sync_conn, checkfirst=True))

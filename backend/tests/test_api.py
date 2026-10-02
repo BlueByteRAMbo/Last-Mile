@@ -9,7 +9,6 @@ from app import main as main_module
 from app import simulator as simulator_module
 from app import world as world_module
 from app.world import world
-from app.db import Base
 from app.models import Order
 
 pytestmark = pytest.mark.asyncio

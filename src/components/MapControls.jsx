@@ -1,5 +1,5 @@
 import React from 'react';
-import { Compass, ZoomIn, ZoomOut, RotateCcw } from 'lucide-react';
+import { Compass, ZoomIn, ZoomOut } from 'lucide-react';
 
 const MapControls = ({ onZoomIn, onZoomOut, onReset }) => {
   return (

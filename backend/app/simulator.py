@@ -15,7 +15,7 @@ import datetime as dt
 import json
 import uuid
 from . import world as world_module
-from .world import world, NON_TERMINAL_STATUSES, ACTIVE_STATUSES
+from .world import world, ACTIVE_STATUSES
 from .catalog import CATALOG
 from .geo import is_on_land
 from .dispatch import (

@@ -5,6 +5,9 @@ import { api } from '../api';
 // The customer-facing surface (src/pages/CustomerTracker.jsx) lives at #track/<order-id> deliberately
 // outside the ops chrome — a real customer never sees the map/KPI dashboard. This widget is the
 // ops-side shortcut to open it for any live order, so it's not buried three clicks deep.
+const RANK = { out_for_delivery: 0, packed: 1, packing: 2, assigned: 3, created: 4 };
+const rank = (o) => RANK[o.status] ?? 5;
+
 const TrackOrderWidget = () => {
   const [orders, setOrders] = useState([]);
   const [selected, setSelected] = useState('');
@@ -12,8 +15,6 @@ const TrackOrderWidget = () => {
 
   // Orders worth tracking first (rider on the road), finished ones last. The list refreshes while the
   // dropdown is open, and the user's pick is kept unless that order disappeared (e.g. after a reset).
-  const RANK = { out_for_delivery: 0, packed: 1, packing: 2, assigned: 3, created: 4 };
-  const rank = (o) => RANK[o.status] ?? 5;
   useEffect(() => {
     if (!open) return;
     let stop = false;

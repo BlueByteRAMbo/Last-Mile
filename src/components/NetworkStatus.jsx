@@ -10,7 +10,7 @@ const NetworkStatus = ({ kpis, orders = [], riders = [] }) => {
 
       <div className="flex flex-col gap-3">
         <div className="flex justify-between items-center">
-          <span className="text-sm text-slate-300">Active Riders</span>
+          <span className="text-sm text-slate-300">Riders Online</span>
           <span className="text-sm font-medium text-white">{activeRiders}</span>
         </div>
         <div className="flex justify-between items-center">

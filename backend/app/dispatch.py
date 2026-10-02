@@ -7,8 +7,7 @@ Lower score wins. Every decision returns ranked candidates + reasons for the UI 
 import math
 import uuid
 import datetime as dt
-from sqlalchemy import select
-from .models import DarkStore, InventoryItem, Rider, Order
+from .models import DarkStore, Rider, Order
 
 W_ETA = 1.0
 W_PACK = 0.6
@@ -63,7 +62,8 @@ def _segment_intersects_zone(lat1, lng1, lat2, lng2, zone) -> bool:
 
 def active_traffic_zones():
     now = dt.datetime.now(dt.timezone.utc)
-    return [z for z in TRAFFIC_ZONES if z["expires_at"] > now]
+    TRAFFIC_ZONES[:] = [z for z in TRAFFIC_ZONES if z["expires_at"] > now]  # drop expired zones, don't just hide them
+    return list(TRAFFIC_ZONES)
 
 
 def traffic_multiplier_for_leg(lat1, lng1, lat2, lng2) -> float:
@@ -93,73 +93,17 @@ def estimate_zone_adjusted_duration(polyline: list, speed_kmh: float, zone: dict
         total += (km / max(speed_kmh * mult, 1)) * 3600
     return total
 
-
-async def store_has_stock(session, store: DarkStore, items: list) -> bool:
-    for it in items:
-        row = (await session.execute(
-            select(InventoryItem).where(InventoryItem.store_id == store.id, InventoryItem.sku == it["sku"])
-        )).scalar_one_or_none()
-        if row is None or (row.qty - row.reserved_qty) < it["qty"]:
-            return False
-    return True
-
-
 def check_stock(inventory_map: dict, store_id: str, items: list) -> bool:
-    """Pure in-memory version of store_has_stock, against a pre-fetched {(store_id, sku): InventoryItem} map."""
+    """True if the store can cover every item, against an {(store_id, sku): InventoryItem} map."""
     for it in items:
         row = inventory_map.get((store_id, it["sku"]))
         if row is None or (row.qty - row.reserved_qty) < it["qty"]:
             return False
     return True
 
-
-async def fetch_inventory_map(session, store_ids: list[str] | None = None) -> dict:
-    """One round trip instead of one query per (store, sku) pair."""
-    q = select(InventoryItem)
-    if store_ids:
-        q = q.where(InventoryItem.store_id.in_(store_ids))
-    rows = (await session.execute(q)).scalars().all()
-    return {(r.store_id, r.sku): r for r in rows}
-
-
-async def fetch_scoring_context(session):
-    """Everything score_candidates needs, in three round trips total instead of ~2 per rider/store.
-    Callers should pass the SAME context to every order scored in one tick, and patch it in-memory
-    (reserve_stock_in_map / active_by_rider bookkeeping) as orders get assigned so later orders in the
-    same batch see the effect of earlier ones without re-querying."""
-    stores = (await session.execute(select(DarkStore))).scalars().all()
-    riders = (await session.execute(select(Rider))).scalars().all()
-    active_orders = (await session.execute(
-        select(Order).where(Order.rider_id.isnot(None), Order.status.in_(["assigned", "packing", "packed", "out_for_delivery"]))
-    )).scalars().all()
-    active_by_rider: dict[str, list[Order]] = {}
-    for o in active_orders:
-        active_by_rider.setdefault(o.rider_id, []).append(o)
-    inventory_map = await fetch_inventory_map(session, [s.id for s in stores])
-    return {"stores": stores, "riders": riders, "active_by_rider": active_by_rider, "inventory_map": inventory_map}
-
-
-async def reserve_stock(session, store_id: str, items: list):
-    for it in items:
-        row = (await session.execute(
-            select(InventoryItem).where(InventoryItem.store_id == store_id, InventoryItem.sku == it["sku"])
-        )).scalar_one()
-        row.reserved_qty += it["qty"]
-
-
-async def release_stock(session, store_id: str, items: list):
-    for it in items:
-        row = (await session.execute(
-            select(InventoryItem).where(InventoryItem.store_id == store_id, InventoryItem.sku == it["sku"])
-        )).scalar_one_or_none()
-        if row:
-            row.reserved_qty = max(0, row.reserved_qty - it["qty"])
-
-
 def score_candidates_sync(order: Order, stores, riders, active_by_rider: dict, inventory_map: dict) -> list[dict]:
     """Pure in-memory scoring against a pre-fetched context — no DB round trips. This is what actually
-    runs inside the tick loop; score_candidates() below just fetches a fresh context and calls this,
-    for one-off callers (the explain endpoint, tests) where the batching wouldn't help anyway."""
+    runs inside the tick loop and from the explain endpoint."""
     now = dt.datetime.now(dt.timezone.utc)
     deadline_s = (order.promised_at - now).total_seconds()
     candidates = []
@@ -250,15 +194,6 @@ def score_candidates_sync(order: Order, stores, riders, active_by_rider: dict, i
     candidates.sort(key=lambda c: (not c["feasible"], c["cost"]))
     return candidates
 
-
-async def score_candidates(session, order: Order) -> list[dict]:
-    """One-off convenience wrapper: fetches its own context and scores a single order.
-    Used by the /explain endpoint and tests; the tick loop uses score_candidates_sync directly
-    against a context batch-fetched once per tick instead of once per order."""
-    ctx = await fetch_scoring_context(session)
-    return score_candidates_sync(order, ctx["stores"], ctx["riders"], ctx["active_by_rider"], ctx["inventory_map"])
-
-
 def suggest_split_fulfillment(order: Order, stores, inventory_map: dict) -> dict | None:
     """When no single store can fulfil the whole cart: which store covers the most of it, what's
     still missing there, and a greedy two-store split that covers everything (if one exists).
@@ -294,21 +229,8 @@ def suggest_split_fulfillment(order: Order, stores, inventory_map: dict) -> dict
         "two_store_split": split,
     }
 
-
-async def allocate(session, order: Order) -> dict:
-    """Pick the best feasible candidate. decision["chosen"] is None when nothing is feasible —
-    decision["suggestion"] then carries a split-fulfilment / best-partial-store alternative."""
-    ctx = await fetch_scoring_context(session)
-    candidates = score_candidates_sync(order, ctx["stores"], ctx["riders"], ctx["active_by_rider"], ctx["inventory_map"])
-    feasible = [c for c in candidates if c["feasible"]]
-    if not feasible:
-        return {"chosen": None, "alternatives": [], "all_count": len(candidates),
-                "suggestion": suggest_split_fulfillment(order, ctx["stores"], ctx["inventory_map"])}
-    return {"chosen": feasible[0], "alternatives": feasible[1:5], "all_count": len(candidates), "suggestion": None}
-
-
 def allocate_sync(order: Order, stores, riders, active_by_rider, inventory_map, mode="optimized") -> dict:
-    """Pure in-memory version — see allocate() above for the shape (chosen=None + suggestion when infeasible)."""
+    """Pick the best feasible candidate. decision["chosen"] is None when nothing is feasible — decision["suggestion"] then carries a split-fulfilment / best-partial-store alternative."""
     candidates = score_candidates_sync(order, stores, riders, active_by_rider, inventory_map)
     feasible = [c for c in candidates if c["feasible"]]
     if mode == "nearest":
@@ -332,41 +254,64 @@ BATCH_DETOUR_THRESHOLD_SECONDS = 90.0
 
 
 def cheapest_insertion_cost(rider: Rider, existing_orders: list[Order], new_order: Order, store: DarkStore):
-    """Where in the rider's current stop sequence should the new pickup+drop slot in, at minimum
-    added travel time. Real batching, not just a shared-trip score bonus: a candidate insertion
-    point is only feasible if the extra detour it adds is under BATCH_DETOUR_THRESHOLD_SECONDS
-    (when there's already at least one other stop — a rider's first stop obviously isn't a
-    "detour") AND it doesn't push any already-committed stop past its own promised time.
+    """Where in the rider's current stop sequence should the new drop slot in, at minimum added travel
+    time. Real batching, not just a shared-trip score bonus: a candidate insertion point is only
+    feasible if the extra detour it adds is under BATCH_DETOUR_THRESHOLD_SECONDS (when there's already
+    at least one other stop — a rider's first stop obviously isn't a "detour") AND it doesn't push any
+    already-committed stop past its own promised time.
+
+    Travel is modelled the way simulator.move_riders actually moves a rider: first every distinct
+    store that still has an un-picked-up order (the new order's store included; a store already on the
+    list adds nothing, which is what makes same-store batching cheap), then the customers in sequence.
+    Ignoring the pickup legs made far-away riders look on time when they were not.
     Returns (best_index, added_seconds, feasible) — feasible is False only when every insertion
     point violates one of those two rules, letting the caller fall back to a dedicated solo trip."""
+    from .world import world  # local import: world imports models only, but keep dispatch import-light
     ordered = sorted(existing_orders, key=lambda x: x.route_seq or 0)
-    stops = [(rider.lat, rider.lng)] + [(o.customer_lat, o.customer_lng) for o in ordered]
     now = dt.datetime.now(dt.timezone.utc)
+    here = (rider.lat, rider.lng)
 
-    def cumulative_etas(seq_stops):
-        """seconds-from-now to arrive at each stop in order, walking the polyline of points."""
-        etas, t = [], 0.0
-        for a, b in zip(seq_stops, seq_stops[1:]):
-            t += travel_seconds(a[0], a[1], b[0], b[1], rider.speed_kmh)
+    def leg(a, b):
+        return travel_seconds(a[0], a[1], b[0], b[1], rider.speed_kmh)
+
+    def pickup_stops(orders, extra_store=None):
+        stops = []
+        for o in orders:
+            s = world.store_by_id.get(o.store_id) if o.status in ("assigned", "packing", "packed") else None
+            if s is not None and (s.lat, s.lng) not in stops:
+                stops.append((s.lat, s.lng))
+        if extra_store is not None and (extra_store.lat, extra_store.lng) not in stops:
+            stops.append((extra_store.lat, extra_store.lng))
+        return stops
+
+    def drop_etas(customers, pickups):
+        """seconds-from-now to reach each customer, after visiting every pickup stop first."""
+        t, pos = 0.0, here
+        for p in pickups:
+            t += leg(pos, p)
+            pos = p
+        etas = []
+        for c in customers:
+            t += leg(pos, c)
+            pos = c
             etas.append(t)
         return etas
 
-    best_idx, best_added, best_feasible = len(stops) - 1, None, False
-    for i in range(1, len(stops) + 1):
-        pre = stops[i - 1]
-        post = stops[i] if i < len(stops) else None
-        added = travel_seconds(pre[0], pre[1], new_order.customer_lat, new_order.customer_lng, rider.speed_kmh)
-        if post:
-            added += travel_seconds(new_order.customer_lat, new_order.customer_lng, post[0], post[1], rider.speed_kmh)
-            added -= travel_seconds(pre[0], pre[1], post[0], post[1], rider.speed_kmh)
+    existing_customers = [(o.customer_lat, o.customer_lng) for o in ordered]
+    base = drop_etas(existing_customers, pickup_stops(ordered))
+    base_total = base[-1] if base else 0.0
+    trial_pickups = pickup_stops(ordered, store)
+    new_customer = (new_order.customer_lat, new_order.customer_lng)
+
+    best_idx, best_added, best_feasible = len(ordered) + 1, None, False
+    for i in range(len(ordered) + 1):
+        trial_customers = existing_customers[:i] + [new_customer] + existing_customers[i:]
+        trial_orders = ordered[:i] + [new_order] + ordered[i:]
+        etas = drop_etas(trial_customers, trial_pickups)
+        added = etas[-1] - base_total
 
         is_batch = len(ordered) > 0  # inserting alongside at least one other order = a real detour
         detour_ok = (not is_batch) or added <= BATCH_DETOUR_THRESHOLD_SECONDS
-
-        # does any stop still arrive on time with the new one inserted at position i?
-        trial_stops = stops[:i] + [(new_order.customer_lat, new_order.customer_lng)] + stops[i:]
-        trial_orders = ordered[:i - 1] + [new_order] + ordered[i - 1:]
-        etas = cumulative_etas(trial_stops)
         deadlines_ok = all(
             now + dt.timedelta(seconds=eta) <= o.promised_at + dt.timedelta(seconds=60)  # small grace, matches feasibility elsewhere
             for eta, o in zip(etas, trial_orders)
@@ -374,47 +319,8 @@ def cheapest_insertion_cost(rider: Rider, existing_orders: list[Order], new_orde
         feasible = detour_ok and deadlines_ok
 
         if best_added is None or (feasible and not best_feasible) or (feasible == best_feasible and added < best_added):
-            best_added, best_idx, best_feasible = added, i, feasible
+            best_added, best_idx, best_feasible = added, i + 1, feasible  # 1-based slot, the convention callers already store in route_seq
     return best_idx, best_added, best_feasible
-
-
-async def reassign_rider_orders(session, rider_id: str):
-    """Free every order still sitting with a rider that just went offline so the next tick
-    can re-run allocate() for them against a different rider/store.
-    ponytail: orders already out_for_delivery keep their rider (the package is physically with
-    them) and are just left to ride out their risk state; only pre-pickup orders get reset.
-    """
-    stuck = (await session.execute(
-        select(Order).where(Order.rider_id == rider_id, Order.status.in_(["assigned", "packing", "packed"]))
-    )).scalars().all()
-    rider = (await session.execute(select(Rider).where(Rider.id == rider_id))).scalar_one_or_none()
-    freed = []
-    for o in stuck:
-        if o.store_id:
-            await release_stock(session, o.store_id, o.items)
-        if rider:
-            rider.current_load_kg = max(0.0, rider.current_load_kg - o.weight_kg)
-        o.status = "created"
-        o.store_id = None
-        o.rider_id = None
-        o.route_seq = None
-        o.assigned_at = None
-        o.packed_at = None
-        freed.append(o.id)
-    return freed
-
-
-async def cancel_order(session, order: Order):
-    if order.status in ("delivered", "failed", "cancelled"):
-        return False
-    if order.store_id:
-        await release_stock(session, order.store_id, order.items)
-    if order.rider_id:
-        rider = (await session.execute(select(Rider).where(Rider.id == order.rider_id))).scalar_one_or_none()
-        if rider:
-            rider.current_load_kg = max(0.0, rider.current_load_kg - order.weight_kg)
-    order.status = "cancelled"
-    return True
 
 
 def add_traffic_zone(lat: float, lng: float, radius_km: float = 2.5, multiplier: float = 0.4, duration_minutes: int = 6) -> dict:
@@ -429,37 +335,6 @@ def add_traffic_zone(lat: float, lng: float, radius_km: float = 2.5, multiplier:
 
 def clear_traffic_zones():
     TRAFFIC_ZONES.clear()
-
-
-async def riders_on_active_route(session, rider_ids: list[str] | None = None) -> dict[str, list[Order]]:
-    """Every rider's currently ordered pending stops, for checking which routes a new zone touches."""
-    q = select(Order).where(Order.status.in_(["assigned", "packing", "packed", "out_for_delivery"]))
-    if rider_ids:
-        q = q.where(Order.rider_id.in_(rider_ids))
-    orders = (await session.execute(q)).scalars().all()
-    by_rider: dict[str, list[Order]] = {}
-    for o in orders:
-        if o.rider_id:
-            by_rider.setdefault(o.rider_id, []).append(o)
-    return by_rider
-
-
-async def riders_affected_by_zone(session, zone: dict) -> list[str]:
-    """Which riders have an active route leg (rider->stop or stop->stop) passing through this zone."""
-    riders = (await session.execute(select(Rider))).scalars().all()
-    by_rider = await riders_on_active_route(session)
-    affected = []
-    for rider in riders:
-        stops = by_rider.get(rider.id)
-        if not stops:
-            continue
-        points = [(rider.lat, rider.lng)] + [(o.customer_lat, o.customer_lng) for o in sorted(stops, key=lambda x: x.route_seq or 0)]
-        for (lat1, lng1), (lat2, lng2) in zip(points, points[1:]):
-            if _segment_intersects_zone(lat1, lng1, lat2, lng2, zone):
-                affected.append(rider.id)
-                break
-    return affected
-
 
 def riders_affected_by_zone_sync(zone: dict, riders: list[Rider], active_orders: list[Order]) -> list[str]:
     """Pure in-memory version for the world-state tick loop — no DB access."""
@@ -558,15 +433,3 @@ def rolling_reoptimize_sync(rider: Rider, pending: list[Order]) -> dict | None:
         "reason": "deadline would have been missed" if fixes_a_miss else "faster sequence found",
         "old_eta_seconds": round(current_total, 1), "new_eta_seconds": round(candidate_total, 1),
     }
-
-
-async def rolling_reoptimize(session, rider_id: str):
-    """One-off convenience wrapper (two queries) for callers outside the tick loop, e.g. reacting
-    immediately to a single disruption. The tick loop itself uses rolling_reoptimize_sync against a
-    batch-fetched rider/order list instead of paying two queries per rider per tick."""
-    pending = (await session.execute(
-        select(Order).where(Order.rider_id == rider_id, Order.status.in_(["assigned", "packing", "packed", "out_for_delivery"]))
-    )).scalars().all()
-    rider = (await session.execute(select(Rider).where(Rider.id == rider_id))).scalar_one_or_none()
-    if rider:
-        rolling_reoptimize_sync(rider, pending)

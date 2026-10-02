@@ -16,11 +16,12 @@ export default function GuidedJourney({ orderId }) {
     api.journey(orderId).then(result => { if (alive) setContext(result); }).catch(e => { if (alive) setNotice(e.message); });
     return () => { alive = false; };
   }, [orderId, data?.status, data?.rider_id, data?.route_version, data?.route_events?.length]);
+  const hasContext = Boolean(context), hasStore = Boolean(data?.store);
   useEffect(() => {
-    if (step >= 3 || !context || (step > 0 && !data?.store)) return;
+    if (step >= 3 || !hasContext || (step > 0 && !hasStore)) return;
     const timer = setTimeout(() => setStep(s => Math.min(s + 1, 3)), 4500);
     return () => clearTimeout(timer);
-  }, [step, context?.decision?.chosen?.rider_id, data?.store?.id]);
+  }, [step, hasContext, hasStore, context?.decision?.chosen?.rider_id, data?.store?.id]);
   useEffect(() => {
     if (!decision) return;
     const timer = setTimeout(() => setDecision(null), 8000);

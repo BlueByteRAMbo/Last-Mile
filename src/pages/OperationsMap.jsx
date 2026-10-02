@@ -60,8 +60,6 @@ const OperationsMap = () => {
     if (window.mapAPI) window.mapAPI.resetView();
   };
 
-  const isSimulation = false;
-
   return (
     <div className="relative w-full h-full bg-route-base">
       <TopNavigation
@@ -71,13 +69,12 @@ const OperationsMap = () => {
         onTabChange={setActiveTab}
       />
 
-      {!isSimulation && <KPIBar kpis={live.kpis} orders={live.orders} riders={live.riders} />}
-      {!isSimulation && <ScenarioControls />}
+      <KPIBar kpis={live.kpis} orders={live.orders} riders={live.riders} />
+      <ScenarioControls />
 
       <RouteMap
         onEntitySelect={handleEntitySelect}
         liveOperations={liveOperations}
-        simulationMode={isSimulation}
         darkStores={live.darkStores}
         riders={live.riders}
         orders={live.orders}
@@ -97,25 +94,21 @@ const OperationsMap = () => {
         </Suspense>
       )}
 
-      {!isSimulation && (
-        <>
-          <EntityPanel
-            entity={selectedEntity}
-            riderDetail={riderDetail}
-            onClose={() => setSelectedEntity(null)}
-          />
+      <EntityPanel
+        entity={selectedEntity}
+        riderDetail={riderDetail}
+        onClose={() => setSelectedEntity(null)}
+      />
 
-          <MapLegend />
+      <MapLegend />
 
-          <MapControls
-            onZoomIn={handleZoomIn}
-            onZoomOut={handleZoomOut}
-            onReset={handleReset}
-          />
+      <MapControls
+        onZoomIn={handleZoomIn}
+        onZoomOut={handleZoomOut}
+        onReset={handleReset}
+      />
 
-          <NetworkStatus kpis={live.kpis} orders={live.orders} riders={live.riders} />
-        </>
-      )}
+      <NetworkStatus kpis={live.kpis} orders={live.orders} riders={live.riders} />
     </div>
   );
 };

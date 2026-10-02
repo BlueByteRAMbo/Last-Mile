@@ -1,4 +1,3 @@
-import datetime as dt
 import pytest
 
 
@@ -12,191 +11,131 @@ def test_naive_mode_chooses_nearest_eligible_rider_instead_of_weighted_cost(monk
     monkeypatch.setattr(dispatch, 'score_candidates_sync', lambda *args: candidates)
     assert dispatch.allocate_sync(None, [], [], {}, {}, 'nearest')['chosen']['rider_id'] == 'near'
     assert dispatch.allocate_sync(None, [], [], {}, {}, 'optimized')['chosen']['rider_id'] == 'far'
-from app.dispatch import (
-    score_candidates, score_candidates_sync, allocate, reserve_stock, release_stock,
-    reassign_rider_orders, cancel_order, store_has_stock, cheapest_insertion_cost,
-)
-from .conftest import make_store, make_rider, make_order, make_inventory, utcnow
+from app.dispatch import score_candidates_sync, allocate_sync, check_stock, cheapest_insertion_cost
+from app.world import world
+from .conftest import make_store, make_rider, make_order, make_inventory
+from .test_high_fixes import isolated_world  # noqa: F401  (fixture)
 
 
-async def test_out_of_stock_store_rejected(session):
-    store = make_store()
-    session.add_all([store, make_inventory(qty=0), make_rider()])
-    order = make_order()
-    session.add(order)
-    await session.flush()
-
-    assert await store_has_stock(session, store, order.items) is False
-    candidates = await score_candidates(session, order)
-    assert candidates == []
+def inv_map(*rows):
+    return {(r.store_id, r.sku): r for r in rows}
 
 
-async def test_overloaded_and_offline_riders_excluded(session):
-    session.add_all([
-        make_store(), make_inventory(qty=10),
-        make_rider(id="RX-FULL", load=14.5, capacity_kg=15.0),  # 0.5kg spare, order needs 5kg
-        make_rider(id="RX-OFF", status="OFFLINE"),
-        make_rider(id="RX-OK"),
-    ])
+def test_out_of_stock_store_rejected():
+    store, order = make_store(), make_order()
+    inventory = inv_map(make_inventory(qty=0))
+    assert check_stock(inventory, "DS-1", order.items) is False
+    assert score_candidates_sync(order, [store], [make_rider()], {}, inventory) == []
+
+
+def test_overloaded_and_offline_riders_excluded():
     order = make_order(weight=5.0, items=[{"sku": "SKU-A", "name": "A", "qty": 1, "weight_kg": 5.0}])
-    session.add(order)
-    await session.flush()
-
-    candidates = await score_candidates(session, order)
+    riders = [make_rider(id="RX-FULL", load=14.5, capacity_kg=15.0),  # 0.5kg spare, order needs 5kg
+              make_rider(id="RX-OFF", status="OFFLINE"), make_rider(id="RX-OK")]
+    candidates = score_candidates_sync(order, [make_store()], riders, {}, inv_map(make_inventory(qty=10)))
     rider_ids = {c["rider_id"] for c in candidates}
-    assert "RX-FULL" not in rider_ids
-    assert "RX-OFF" not in rider_ids
+    assert "RX-FULL" not in rider_ids and "RX-OFF" not in rider_ids
     assert "RX-OK" in rider_ids
 
 
-async def test_tight_deadline_marked_infeasible(session):
+def test_tight_deadline_marked_infeasible():
     far_store = make_store(id="DS-FAR", lat=20.5, lng=74.5)  # ~190km away
-    session.add_all([far_store, make_inventory(store_id="DS-FAR", qty=10), make_rider(lat=20.5, lng=74.5)])
     order = make_order(promise_min=1)  # 1 minute promise, impossible over that distance
-    session.add(order)
-    await session.flush()
-
-    candidates = await score_candidates(session, order)
+    candidates = score_candidates_sync(order, [far_store], [make_rider(lat=20.5, lng=74.5)], {},
+                                       inv_map(make_inventory(store_id="DS-FAR", qty=10)))
     assert all(c["feasible"] is False for c in candidates if c["store_id"] == "DS-FAR") or candidates == []
 
 
-async def test_priority_order_scores_lower_cost(session):
-    session.add_all([make_store(), make_inventory(qty=10), make_rider()])
-    normal = make_order(id="ORD-N", priority=False)
-    urgent = make_order(id="ORD-P", priority=True)
-    session.add_all([normal, urgent])
-    await session.flush()
-
-    normal_cost = (await score_candidates(session, normal))[0]["cost"]
-    urgent_cost = (await score_candidates(session, urgent))[0]["cost"]
+def test_priority_order_scores_lower_cost():
+    args = ([make_store()], [make_rider()], {}, inv_map(make_inventory(qty=10)))
+    normal_cost = score_candidates_sync(make_order(id="ORD-N", priority=False), *args)[0]["cost"]
+    urgent_cost = score_candidates_sync(make_order(id="ORD-P", priority=True), *args)[0]["cost"]
     assert urgent_cost < normal_cost
 
 
-async def test_batching_benefit_favors_rider_already_at_store(session):
+def test_batching_benefit_favors_rider_already_at_store(isolated_world):  # noqa: F811
     store = make_store()
-    session.add_all([store, make_inventory(qty=10)])
-    busy_rider = make_rider(id="RX-BUSY")
-    idle_rider = make_rider(id="RX-IDLE")
-    session.add_all([busy_rider, idle_rider])
+    world.stores, world.store_by_id = [store], {store.id: store}
+    busy, idle = make_rider(id="RX-BUSY"), make_rider(id="RX-IDLE")
     existing = make_order(id="ORD-EXIST")
-    session.add(existing)
-    await session.flush()
-    existing.rider_id = busy_rider.id
-    existing.store_id = store.id
-    existing.status = "packing"
-    new_order = make_order(id="ORD-NEW")
-    session.add(new_order)
-    await session.flush()
-
-    candidates = await score_candidates(session, new_order)
-    busy_cost = next(c["cost"] for c in candidates if c["rider_id"] == "RX-BUSY" and c["store_id"] == store.id)
-    idle_cost = next(c["cost"] for c in candidates if c["rider_id"] == "RX-IDLE" and c["store_id"] == store.id)
+    existing.rider_id, existing.store_id, existing.status = busy.id, store.id, "packing"
+    candidates = score_candidates_sync(make_order(id="ORD-NEW"), [store], [busy, idle], {busy.id: [existing]},
+                                       inv_map(make_inventory(qty=10)))
+    busy_cost = next(c["cost"] for c in candidates if c["rider_id"] == "RX-BUSY")
+    idle_cost = next(c["cost"] for c in candidates if c["rider_id"] == "RX-IDLE")
     # batching benefit (-W_BATCH) outweighs the +1 workload penalty for the busy rider
     assert busy_cost < idle_cost
 
 
-async def test_allocate_reserves_stock_and_picks_best(session):
-    session.add_all([make_store(), make_inventory(qty=1), make_rider()])
-    order = make_order()
-    session.add(order)
-    await session.flush()
-
-    decision = await allocate(session, order)
-    assert decision is not None
+def test_allocate_picks_best_and_reservation_exhausts_stock(isolated_world):  # noqa: F811
+    store, order = make_store(), make_order()
+    world.stores, world.store_by_id = [store], {store.id: store}
+    world.inventory = inv_map(make_inventory(qty=1))
+    decision = allocate_sync(order, world.stores, [make_rider()], {}, world.inventory)
     assert decision["chosen"]["store_id"] == "DS-1"
-    await reserve_stock(session, "DS-1", order.items)
-
-    from app.models import InventoryItem
-    from sqlalchemy import select
-    inv = (await session.execute(select(InventoryItem).where(InventoryItem.store_id == "DS-1"))).scalar_one()
-    assert inv.reserved_qty == 1
-    assert inv.qty - inv.reserved_qty == 0  # now out of stock for the next order
+    world.reserve_stock("DS-1", order.items)
+    assert world.inventory[("DS-1", "SKU-A")].reserved_qty == 1
+    assert check_stock(world.inventory, "DS-1", order.items) is False  # nothing left for the next order
 
 
-async def test_release_stock_reverses_reservation(session):
-    session.add_all([make_store(), make_inventory(qty=5)])
-    await session.flush()
+def test_release_stock_reverses_reservation(isolated_world):  # noqa: F811
+    world.inventory = inv_map(make_inventory(qty=5))
     order = make_order()
-    await reserve_stock(session, "DS-1", order.items)
-
-    from app.models import InventoryItem
-    from sqlalchemy import select
-    inv = (await session.execute(select(InventoryItem).where(InventoryItem.store_id == "DS-1"))).scalar_one()
-    assert inv.reserved_qty == 1
-
-    await release_stock(session, "DS-1", order.items)
-    inv = (await session.execute(select(InventoryItem).where(InventoryItem.store_id == "DS-1"))).scalar_one()
-    assert inv.reserved_qty == 0
+    world.reserve_stock("DS-1", order.items)
+    assert world.inventory[("DS-1", "SKU-A")].reserved_qty == 1
+    world.release_stock("DS-1", order.items)
+    assert world.inventory[("DS-1", "SKU-A")].reserved_qty == 0
 
 
-async def test_rider_dropout_frees_pre_pickup_orders(session):
-    store = make_store()
-    rider = make_rider(id="RX-DROP", load=2.0)
-    session.add_all([store, make_inventory(qty=10), rider])
-    o1 = make_order(id="ORD-1", weight=1.0)
-    o2_out_for_delivery = make_order(id="ORD-2", weight=1.0)
-    session.add_all([o1, o2_out_for_delivery])
-    await session.flush()
-    o1.rider_id = rider.id
-    o1.store_id = store.id
-    o1.status = "packing"
-    o2_out_for_delivery.rider_id = rider.id
-    o2_out_for_delivery.store_id = store.id
-    o2_out_for_delivery.status = "out_for_delivery"  # already picked up -> stays with rider
+def test_cancel_order_releases_stock_and_load(isolated_world):  # noqa: F811
+    store, rider, order = make_store(), make_rider(id="RX-C", load=3.0), make_order(weight=3.0)
+    world.stores, world.store_by_id = [store], {store.id: store}
+    world.riders, world.rider_by_id = [rider], {rider.id: rider}
+    world.inventory = inv_map(make_inventory(qty=10))
+    world.orders = {order.id: order}
+    world.reserve_stock(store.id, order.items)
+    order.store_id, order.rider_id, order.status = store.id, rider.id, "packing"
 
-    freed = await reassign_rider_orders(session, "RX-DROP")
-    await session.flush()
-
-    assert "ORD-1" in freed
-    assert "ORD-2" not in freed
-    assert o1.status == "created"
-    assert o1.rider_id is None
-    assert o1.store_id is None
-    assert o2_out_for_delivery.status == "out_for_delivery"  # untouched
+    assert world.cancel_order(order) is True
+    assert order.status == "cancelled" and rider.current_load_kg == 0.0
+    assert world.inventory[(store.id, "SKU-A")].reserved_qty == 0
+    assert world.cancel_order(order) is False  # cancelling twice is a no-op, not a double-release
 
 
-async def test_cancel_order_releases_stock_and_load(session):
-    store = make_store()
-    rider = make_rider(id="RX-C", load=3.0)
-    session.add_all([store, make_inventory(qty=10), rider])
-    order = make_order(weight=3.0)
-    session.add(order)
-    await session.flush()
-    await reserve_stock(session, store.id, order.items)
-    order.store_id = store.id
-    order.rider_id = rider.id
-    order.status = "packing"
-
-    ok = await cancel_order(session, order)
-    assert ok is True
-    assert order.status == "cancelled"
-    assert rider.current_load_kg == 0.0
-
-    from app.models import InventoryItem
-    from sqlalchemy import select
-    inv = (await session.execute(select(InventoryItem).where(InventoryItem.store_id == store.id))).scalar_one()
-    assert inv.reserved_qty == 0
-
-    # cancelling twice is a no-op, not a double-release
-    assert await cancel_order(session, order) is False
-
-
-async def test_assignment_stability_keeps_incumbent_rider(session):
-    store = make_store()
-    session.add_all([store, make_inventory(qty=10)])
-    incumbent = make_rider(id="RX-INC")
-    contender = make_rider(id="RX-NEW")
-    session.add_all([incumbent, contender])
+def test_assignment_stability_keeps_incumbent_rider():
     order = make_order()
-    session.add(order)
-    await session.flush()
-    order.rider_id = incumbent.id  # already committed to this rider
-
-    candidates = await score_candidates(session, order)
+    order.rider_id = "RX-INC"  # already committed to this rider
+    candidates = score_candidates_sync(order, [make_store()], [make_rider(id="RX-INC"), make_rider(id="RX-NEW")], {},
+                                       inv_map(make_inventory(qty=10)))
     incumbent_cost = next(c["cost"] for c in candidates if c["rider_id"] == "RX-INC")
     contender_cost = next(c["cost"] for c in candidates if c["rider_id"] == "RX-NEW")
     # identical physical situation otherwise -> stability penalty makes switching strictly worse
     assert incumbent_cost < contender_cost
+
+
+def test_batching_accounts_for_the_pickup_trip(isolated_world):  # noqa: F811
+    """A rider far from the store used to look on time because only the drop legs were counted."""
+    store = make_store(lat=19.10, lng=72.85)
+    world.stores, world.store_by_id = [store], {store.id: store}
+    far_rider = make_rider(lat=19.40, lng=72.85, speed=30.0)  # ~33 km from the store
+    existing = make_order(id="ORD-1", lat=19.102, lng=72.852, promise_min=30)
+    existing.store_id, existing.status = store.id, "packing"
+    new = make_order(id="ORD-2", lat=19.103, lng=72.853, promise_min=30)
+    _, _, feasible = cheapest_insertion_cost(far_rider, [existing], new, store)
+    assert feasible is False  # an hour of riding to even reach the store
+    near_rider = make_rider(lat=19.10, lng=72.85, speed=30.0)
+    assert cheapest_insertion_cost(near_rider, [existing], new, store)[2] is True
+
+
+def test_same_store_batching_adds_no_second_pickup_trip(isolated_world):  # noqa: F811
+    store = make_store(lat=19.10, lng=72.85)
+    world.stores, world.store_by_id = [store], {store.id: store}
+    rider = make_rider(lat=19.10, lng=72.85, speed=30.0)
+    existing = make_order(id="ORD-1", lat=19.102, lng=72.852, promise_min=30)
+    existing.store_id, existing.status = store.id, "packed"
+    new = make_order(id="ORD-2", lat=19.103, lng=72.853, promise_min=30)
+    _, added, feasible = cheapest_insertion_cost(rider, [existing], new, store)
+    assert feasible and added < 60  # just the extra drop, not a return to the store
 
 
 def test_batch_rejected_when_detour_exceeds_threshold():

@@ -10,7 +10,6 @@ once the real polyline arrives.
 """
 import os
 import math
-import asyncio
 from collections import OrderedDict
 
 import httpx

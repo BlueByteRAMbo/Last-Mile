@@ -6,9 +6,10 @@ const OptimizationPanel = ({ riders }) => {
   const [riderId, setRiderId] = useState(null);
   const [route, setRoute] = useState(null);
 
+  const firstBusyId = busyRiders[0]?.id;
   useEffect(() => {
-    if (!riderId && busyRiders[0]) setRiderId(busyRiders[0].id);
-  }, [busyRiders]);
+    if (!riderId && firstBusyId) setRiderId(firstBusyId);
+  }, [riderId, firstBusyId]);
 
   useEffect(() => {
     if (!riderId) return;

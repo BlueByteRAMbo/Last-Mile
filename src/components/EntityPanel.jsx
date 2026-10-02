@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { X, Navigation, Package, Battery, Clock, TrendingUp } from 'lucide-react';
+import { X, Navigation, Package, Battery, TrendingUp } from 'lucide-react';
 import { api } from '../api';
 
 const riskColor = (risk) => ({
