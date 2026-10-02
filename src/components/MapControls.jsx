@@ -3,7 +3,7 @@ import { Compass, ZoomIn, ZoomOut, RotateCcw } from 'lucide-react';
 
 const MapControls = ({ onZoomIn, onZoomOut, onReset }) => {
   return (
-    <div className="absolute bottom-6 right-72 mr-4 z-10 pointer-events-auto flex flex-col gap-2">
+    <div className="absolute bottom-6 right-4 md:right-72 md:mr-4 z-10 pointer-events-auto flex flex-col gap-2">
       <button 
         onClick={onReset}
         className="bg-route-base/80 backdrop-blur-md p-2 rounded-lg border border-white/5 shadow-lg text-slate-400 hover:text-white transition-colors flex items-center justify-center mb-2"

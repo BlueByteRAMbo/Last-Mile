@@ -5,7 +5,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Literal
 import os
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Header
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func
@@ -369,6 +369,9 @@ async def create_order(body: OrderCreate):
             raise HTTPException(422, 'Unknown catalog item')
         item['name'], item['weight_kg'] = product['name'], product['weight_kg']
     weight = sum(it["qty"] * it["weight_kg"] for it in items)
+    max_carry = max((r.capacity_kg for r in world.riders), default=None)
+    if max_carry is not None and weight > max_carry:
+        raise HTTPException(422, f"This basket weighs {weight:.1f} kg but a rider can carry at most {max_carry:g} kg per delivery. Please split it into smaller orders.")
     now = dt.datetime.now(dt.timezone.utc)
     order = Order(
         id=f"ORD-{uuid.uuid4().hex[:8].upper()}",
@@ -576,9 +579,13 @@ async def evaluate_reroute(rider, zone) -> dict:
 @app.post("/disruptions/{kind}", dependencies=[Depends(require_ops)])
 async def trigger_disruption(
     kind: str, target: str | None = None,
-    lat: float | None = None, lng: float | None = None,
-    radius_km: float = 2.5, multiplier: float = 0.35, duration_minutes: int = 6,
+    lat: float | None = Query(default=None, ge=-90, le=90), lng: float | None = Query(default=None, ge=-180, le=180),
+    radius_km: float = Query(default=2.5, gt=0, le=10),
+    multiplier: float = Query(default=0.35, ge=0.05, le=1.0),  # 0 froze riders; >1 would speed them up
+    duration_minutes: int = Query(default=6, ge=1, le=60),
 ):
+    if (lat is None) != (lng is None):
+        raise HTTPException(422, "Provide both lat and lng, or neither")
     if kind == "traffic":
         if lat is not None and lng is not None:
             zone_lat, zone_lng = lat, lng  # UI click-to-place

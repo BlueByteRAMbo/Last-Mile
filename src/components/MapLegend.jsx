@@ -2,7 +2,7 @@ import React from 'react';
 
 const MapLegend = () => {
   return (
-    <div className="absolute bottom-6 left-6 z-10 pointer-events-auto bg-route-base/80 backdrop-blur-md p-4 rounded-lg border border-white/5 shadow-lg w-48">
+    <div className="hidden md:block absolute bottom-6 left-6 z-10 pointer-events-auto bg-route-base/80 backdrop-blur-md p-4 rounded-lg border border-white/5 shadow-lg w-48">
       <h3 className="text-xs font-semibold text-slate-400 tracking-wider mb-3">MAP LEGEND</h3>
       
       <div className="flex flex-col gap-2">

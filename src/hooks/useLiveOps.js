@@ -19,7 +19,8 @@ export default function useLiveOps() {
     const close = connectWs((msg) => {
       if (msg.type !== 'tick') return;
       setConnected(true);
-      setDarkStores(msg.dark_stores);
+      // The tick only carries id/name/position; merge so the polled packing/queue counts aren't wiped every 2s
+      setDarkStores(prev => msg.dark_stores.map(s => ({ ...prev.find(p => p.id === s.id), ...s })));
       setRiders(msg.riders);
       setOrders(msg.orders);
       setTrafficZones(msg.traffic_zones || []);

@@ -5,7 +5,7 @@ import SpeedSelector from './SpeedSelector';
 
 const TopNavigation = ({ liveOperations, setLiveOperations, activeTab, onTabChange }) => {
   return (
-    <div className="absolute top-0 left-0 w-full z-40 flex items-center justify-between p-4 px-6 pointer-events-none">
+    <div className="absolute top-0 left-0 w-full z-40 flex flex-wrap items-start md:items-center justify-between gap-2 p-3 md:p-4 md:px-6 pointer-events-none">
       
       {/* Brand */}
       <div className="flex flex-col pointer-events-auto bg-route-base/80 backdrop-blur-md p-3 rounded-lg border border-white/5 shadow-lg">
@@ -17,6 +17,15 @@ const TopNavigation = ({ liveOperations, setLiveOperations, activeTab, onTabChan
           LIVE OPERATIONS
         </div>
       </div>
+
+      {/* Section picker for narrow screens, where the tab row below is hidden */}
+      <select
+        aria-label="Section"
+        value={activeTab}
+        onChange={e => (e.target.value === 'Shop' ? (window.location.hash = 'shop') : onTabChange(e.target.value))}
+        className="md:hidden pointer-events-auto bg-route-base/80 backdrop-blur-md text-sm text-white rounded-lg border border-white/10 px-3 py-2">
+        {['Overview', 'Orders', 'Riders', 'Dark Stores', 'Optimization', 'Analytics', 'Shop'].map(tab => <option key={tab} value={tab}>{tab}</option>)}
+      </select>
 
       {/* Nav Links */}
       <div className="hidden md:flex items-center gap-6 pointer-events-auto bg-route-base/80 backdrop-blur-md px-6 py-3 rounded-full border border-white/5 shadow-lg">
@@ -31,7 +40,7 @@ const TopNavigation = ({ liveOperations, setLiveOperations, activeTab, onTabChan
       </div>
 
       {/* Right Controls */}
-      <div className="flex items-center gap-4 pointer-events-auto bg-route-base/80 backdrop-blur-md p-3 px-5 rounded-lg border border-white/5 shadow-lg">
+      <div className="flex items-center gap-2 md:gap-4 pointer-events-auto bg-route-base/80 backdrop-blur-md p-2 md:p-3 md:px-5 rounded-lg border border-white/5 shadow-lg">
         <button 
           onClick={() => setLiveOperations(!liveOperations)}
           className="flex items-center gap-2 text-sm font-medium cursor-pointer hover:bg-white/5 px-2 py-1 rounded"
@@ -45,7 +54,7 @@ const TopNavigation = ({ liveOperations, setLiveOperations, activeTab, onTabChan
         <div className="text-sm font-medium text-slate-300 hidden lg:block">Mumbai</div>
         <div className="text-sm text-slate-500 hidden lg:block">{new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>
       </div>
-      <div className="absolute top-20 right-6 pointer-events-auto">
+      <div className="absolute top-32 md:top-20 right-3 md:right-6 pointer-events-auto">
         <SpeedSelector />
       </div>
     </div>

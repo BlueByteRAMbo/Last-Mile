@@ -82,9 +82,16 @@ def customer_snapshot(order):
                    ('picked_up', 'Picked up', 'PICKED_UP', order.picked_up_at),
                    ('out_for_delivery', 'On the way', 'PICKED_UP', order.picked_up_at),
                    ('delivered', 'Delivered', 'DELIVERED', order.delivered_at)]
+    # A stage is reached only if the order's current status has got that far. Judging by past events alone
+    # kept showing "Packing ✓" after a stock-out sent the order back to the start. Cancelled/failed orders
+    # keep whatever history they actually earned.
+    reached_rank = {'created': 0, 'assigned': 1, 'packing': 2, 'packed': 3, 'out_for_delivery': 4, 'delivered': 5}.get(order.status)
+    stage_rank = {'created': 0, 'store': 1, 'rider': 1, 'packing': 2, 'packed': 3, 'picked_up': 4, 'out_for_delivery': 4, 'delivered': 5}
     stages = []
     for key, label, event_type, fallback in event_types:
         timestamp = next((e.ts for e in reversed(events) if e.type == event_type), fallback)
+        if reached_rank is not None and stage_rank[key] > reached_rank:
+            timestamp = None
         detail = store.name if key == 'store' and store else rider.name if key == 'rider' and rider else None
         stages.append({'key': key, 'label': label, 'done': timestamp is not None,
                        'ts': aware(timestamp).isoformat() if timestamp else None, 'detail': detail})

@@ -52,7 +52,7 @@ const EntityPanel = ({ entity, riderDetail, onClose }) => {
   const rider = entity.type === 'RIDER' ? { ...entity.data, ...(riderDetail || {}) } : null;
 
   return (
-    <div className="absolute top-24 right-6 z-30 pointer-events-auto bg-route-panel/95 backdrop-blur-md p-5 rounded-lg border border-white/10 shadow-2xl w-80 max-h-[calc(100%-7rem)] overflow-y-auto">
+    <div className="absolute top-56 md:top-24 right-3 md:right-6 max-w-[calc(100vw-1.5rem)] z-30 pointer-events-auto bg-route-panel/95 backdrop-blur-md p-5 rounded-lg border border-white/10 shadow-2xl w-80 max-h-[calc(100%-7rem)] overflow-y-auto">
       <div className="flex justify-between items-start mb-4">
         <div>
           <h2 className="text-lg font-bold text-white mb-0.5">{entity.name || entity.id}</h2>

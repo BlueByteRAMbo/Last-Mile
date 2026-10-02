@@ -15,21 +15,27 @@ const NewOrderForm = ({ onClose, onCreated }) => {
   const [priority, setPriority] = useState(false);
   const [promiseMin, setPromiseMin] = useState(20);
   const [submitting, setSubmitting] = useState(false);
+  const [formError, setFormError] = useState('');
 
-  useEffect(() => { api.catalog().then(c => { setCatalog(c); if (c[0]) setSku(c[0].sku); }); }, []);
+  useEffect(() => { api.catalog().then(c => { setCatalog(c); if (c[0]) setSku(c[0].sku); }).catch(() => setFormError('Could not load the catalog.')); }, []);
 
   const submit = async () => {
     if (!sku) return;
-    setSubmitting(true);
+    setSubmitting(true); setFormError('');
     const item = catalog.find(c => c.sku === sku);
-    await api.createOrder({
-      customer_lat: Number(lat), customer_lng: Number(lng),
-      items: [{ sku, name: item?.name || sku, qty: Number(qty), weight_kg: item?.weight_kg || 0.3 }],
-      priority, promise_minutes: Number(promiseMin),
-    });
-    setSubmitting(false);
-    onCreated();
-    onClose();
+    try {
+      await api.createOrder({
+        customer_lat: Number(lat), customer_lng: Number(lng),
+        items: [{ sku, name: item?.name || sku, qty: Number(qty), weight_kg: item?.weight_kg || 0.3 }],
+        priority, promise_minutes: Number(promiseMin),
+      });
+      onCreated();
+      onClose();
+    } catch (e) {
+      setFormError(e.message);  // e.g. location in the water, basket too heavy, quantity out of range
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -42,7 +48,7 @@ const NewOrderForm = ({ onClose, onCreated }) => {
         <select value={sku} onChange={e => setSku(e.target.value)} className="bg-white/5 text-xs text-white rounded px-2 py-1.5 border border-white/10">
           {catalog.map(c => <option key={c.sku} value={c.sku}>{c.name}</option>)}
         </select>
-        <input type="number" min="1" value={qty} onChange={e => setQty(e.target.value)} placeholder="Qty"
+        <input type="number" min="1" max="20" value={qty} onChange={e => setQty(e.target.value)} placeholder="Qty"
           className="bg-white/5 text-xs text-white rounded px-2 py-1.5 border border-white/10" />
         <input type="number" step="0.001" value={lat} onChange={e => setLat(e.target.value)} placeholder="Lat"
           className="bg-white/5 text-xs text-white rounded px-2 py-1.5 border border-white/10" />
@@ -54,6 +60,7 @@ const NewOrderForm = ({ onClose, onCreated }) => {
           <input type="checkbox" checked={priority} onChange={e => setPriority(e.target.checked)} /> Express / Priority
         </label>
       </div>
+      {formError && <p role="alert" className="text-xs text-route-red">{formError}</p>}
       <button onClick={submit} disabled={submitting}
         className="w-full mt-1 text-xs font-medium bg-route-cyan/20 text-route-cyan hover:bg-route-cyan/30 transition-colors rounded px-3 py-2 disabled:opacity-50">
         {submitting ? 'Placing…' : 'Place Order'}
@@ -73,6 +80,7 @@ const OrdersPanel = ({ orders, onSelect }) => {
     setPending(order.id);
     setNotice('');
     try {
+      if (action === 'cancel' && !window.confirm(`Cancel order ${order.id}? This cannot be undone.`)) { setPending(null); return; }
       const result = await api.interveneOrder(order.id, action);
       setUpdated(previous => ({ ...previous, [order.id]: result }));
       setNotice(`${order.id}: ${action === 'boost' ? 'priority boosted' : action === 'reassign' ? `reassigned to ${result.rider_id}` : 'cancelled'}`);
@@ -91,7 +99,7 @@ const OrdersPanel = ({ orders, onSelect }) => {
   const statuses = ['QUEUE', 'AT RISK', 'ALL', 'created', 'assigned', 'packing', 'packed', 'out_for_delivery'];
 
   return (
-    <div className="absolute top-40 left-6 z-10 pointer-events-auto bg-route-panel/95 backdrop-blur-md rounded-lg border border-white/10 shadow-2xl w-96 max-h-[65vh] flex flex-col">
+    <div className="absolute top-56 md:top-40 left-3 md:left-6 max-w-[calc(100vw-1.5rem)] z-10 pointer-events-auto bg-route-panel/95 backdrop-blur-md rounded-lg border border-white/10 shadow-2xl w-96 max-h-[65vh] flex flex-col">
       <div className="p-4 pb-2 border-b border-white/10 flex justify-between items-center">
         <h2 className="text-sm font-bold text-white">Orders ({orders.length})</h2>
         <button onClick={() => setShowForm(s => !s)} className="text-route-cyan hover:text-white flex items-center gap-1 text-xs font-medium">

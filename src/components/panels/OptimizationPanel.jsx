@@ -19,7 +19,7 @@ const OptimizationPanel = ({ riders }) => {
   }, [riderId]);
 
   return (
-    <div className="absolute top-40 left-6 z-10 pointer-events-auto bg-route-panel/95 backdrop-blur-md rounded-lg border border-white/10 shadow-2xl w-96 max-h-[65vh] flex flex-col">
+    <div className="absolute top-56 md:top-40 left-3 md:left-6 max-w-[calc(100vw-1.5rem)] z-10 pointer-events-auto bg-route-panel/95 backdrop-blur-md rounded-lg border border-white/10 shadow-2xl w-96 max-h-[65vh] flex flex-col">
       <div className="p-4 pb-2 border-b border-white/10">
         <h2 className="text-sm font-bold text-white mb-2">Route Optimization</h2>
         <select value={riderId || ''} onChange={e => setRiderId(e.target.value)}

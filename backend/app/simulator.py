@@ -153,7 +153,11 @@ def advance_packing(active_orders, speed_mult=1):
     for store in world.stores:
         packing_now = by_store_packing.get(store.id, [])
         for o in packing_now:
-            elapsed = (now - o.assigned_at).total_seconds() * speed_mult  # speed_mult compresses sim time, same as rider movement
+            # packing time runs from when the order got a slot, not from assignment: an order that queued for a
+            # free slot used to finish instantly, which made packing_capacity meaningless. (Falls back to
+            # assigned_at for orders already mid-packing at startup; ponytail: not persisted.)
+            started = getattr(o, "_pack_started_at", None) or o.assigned_at
+            elapsed = (now - started).total_seconds() * speed_mult  # speed_mult compresses sim time, same as rider movement
             if elapsed >= store.packing_seconds_per_order:
                 o.status = "packed"
                 o.packed_at = now
@@ -167,6 +171,7 @@ def advance_packing(active_orders, speed_mult=1):
         queued.sort(key=lambda o: (0 if o.priority else 1, risk_rank.get(o.risk, 3), o.assigned_at))
         for o in queued[:free_slots]:
             o.status = "packing"
+            o._pack_started_at = now
             world.mark_order_dirty(o.id)
             world.log_event(o.id, "PACKING_STARTED")
 

@@ -7,9 +7,13 @@ const StoresPanel = ({ darkStores, onSelect }) => {
   const [inventory, setInventory] = useState({});
   const [restocking, setRestocking] = useState(null);
 
+  const [error, setError] = useState('');
+
   const loadInventory = async (storeId) => {
-    const inv = await api.storeInventory(storeId);
-    setInventory(prev => ({ ...prev, [storeId]: inv }));
+    try {
+      const inv = await api.storeInventory(storeId);
+      setInventory(prev => ({ ...prev, [storeId]: inv }));
+    } catch (e) { setError(`Could not load inventory: ${e.message}`); }
   };
 
   const toggle = async (store) => {
@@ -19,16 +23,19 @@ const StoresPanel = ({ darkStores, onSelect }) => {
   };
 
   const restock = async (storeId, sku) => {
-    setRestocking(sku);
-    await api.restock(storeId, sku, 50);
-    await loadInventory(storeId);
-    setRestocking(null);
+    setRestocking(sku); setError('');
+    try {
+      await api.restock(storeId, sku, 50);
+      await loadInventory(storeId);
+    } catch (e) { setError(`Restock failed: ${e.message}`); }
+    finally { setRestocking(null); }
   };
 
   return (
-    <div className="absolute top-40 left-6 z-10 pointer-events-auto bg-route-panel/95 backdrop-blur-md rounded-lg border border-white/10 shadow-2xl w-[26rem] max-h-[65vh] flex flex-col">
+    <div className="absolute top-56 md:top-40 left-3 md:left-6 max-w-[calc(100vw-1.5rem)] z-10 pointer-events-auto bg-route-panel/95 backdrop-blur-md rounded-lg border border-white/10 shadow-2xl w-[26rem] max-h-[65vh] flex flex-col">
       <div className="p-4 pb-2 border-b border-white/10">
         <h2 className="text-sm font-bold text-white">Dark Stores ({darkStores.length})</h2>
+        {error && <p role="alert" className="text-[10px] text-route-red mt-1">{error}</p>}
       </div>
       <div className="overflow-y-auto p-3 flex-1">
         {darkStores.map(s => {
@@ -49,7 +56,12 @@ const StoresPanel = ({ darkStores, onSelect }) => {
                     )}
                   </div>
                   <button
-                    onClick={(e) => { e.stopPropagation(); onSelect({ type: 'DARK_STORE', id: s.id, name: s.name, data: s }); api.disrupt('stockout', s.id); }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (!window.confirm(`Simulate a stock-out at ${s.name}? Its unreserved stock drops to zero until restocked.`)) return;
+                      onSelect({ type: 'DARK_STORE', id: s.id, name: s.name, data: s });
+                      api.disrupt('stockout', s.id).catch(err => setError(err.message));
+                    }}
                     className="text-[9px] text-route-amber border border-route-amber/40 rounded px-1.5 py-0.5 hover:bg-route-amber/10">
                     stockout
                   </button>

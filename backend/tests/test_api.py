@@ -371,7 +371,7 @@ async def test_kpis_shape_and_defaults_on_empty_history(client):
     for key in ["avg_delivery_minutes", "on_time_rate_pct", "rider_utilization_pct",
                 "sla_breach_rate_pct", "delivered_count", "active_orders", "zone_density"]:
         assert key in body
-    assert body["on_time_rate_pct"] == 100.0  # no deliveries yet -> vacuously on-time
+    assert body["on_time_rate_pct"] is None  # no deliveries yet -> no data, not a made-up 100%
 
 
 async def test_rider_offline_disruption_frees_their_orders_via_http(client):

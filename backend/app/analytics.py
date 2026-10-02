@@ -112,14 +112,15 @@ def build_analytics(now=None):
     for bucket in buckets:
         if bucket['delivered']:
             bucket['on_time_rate_pct'] = round(100 * bucket['on_time'] / bucket['delivered'], 1)
-    terminal = len(delivered) + failed + cancelled
+    # Operator cancellations are not delivery failures, so they neither count as SLA breaches nor dilute the rate.
+    terminal = len(delivered) + failed
     return {
         'avg_delivery_minutes': round(sum((aware(o.delivered_at) - aware(o.created_at)).total_seconds() / 60
-                                          for o in delivered) / len(delivered), 1) if delivered else 0.0,
-        'on_time_rate_pct': round(100 * on_time / len(delivered), 1) if delivered else 100.0,
+                                          for o in delivered) / len(delivered), 1) if delivered else None,  # None = no data yet, not 0 / 100
+        'on_time_rate_pct': round(100 * on_time / len(delivered), 1) if delivered else None,
         'rider_utilization_pct': round(100 * busy / observed, 1) if observed else 0.0,
         'utilization_basis': 'Busy assignment time / observed simulated shift time; excludes server downtime',
-        'sla_breach_rate_pct': round(100 * (len(delivered) - on_time + failed + cancelled) / terminal, 1) if terminal else 0.0,
+        'sla_breach_rate_pct': round(100 * (len(delivered) - on_time + failed) / terminal, 1) if terminal else None,
         'failed_count': failed + cancelled,  # compatibility with existing KPI consumers
         'failure_count': failed, 'cancelled_count': cancelled,
         'delayed_count': sum(aware(o.promised_at) < now for o in active),

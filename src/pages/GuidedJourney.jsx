@@ -59,7 +59,7 @@ export default function GuidedJourney({ orderId }) {
       {notice && <p role="status" className="flow-notice">{notice}</p>}
       {decision?.candidate_polyline && <p className="text-xs text-route-amber mt-2">Dashed amber: candidate path · gain {Math.round(decision.gain_seconds)}s · threshold {Math.round(decision.threshold_seconds)}s</p>}
       <h3 className="mt-5 mb-2">Route history</h3>{(context?.route_history || []).slice(-8).reverse().map((r, i) => <p key={`${r.ts}-${i}`} className="text-xs text-slate-400 border-t border-white/10 py-2">{new Date(r.ts).toLocaleTimeString()} · {r.switched ? 'Switched to faster route' : r.reason || 'Route updated'}{r.gain_seconds != null ? ` · ${Math.round(r.gain_seconds)}s gain` : ''}</p>)}
-      <div className="mt-4 text-xs text-slate-500">Delivered fleet-wide: {live.kpis?.delivered_count ?? 0} · On-time: {live.kpis?.on_time_rate_pct ?? '—'}%</div>
+      <div className="mt-4 text-xs text-slate-500">Delivered fleet-wide: {live.kpis?.delivered_count ?? 0} · On-time: {live.kpis?.on_time_rate_pct != null ? `${live.kpis.on_time_rate_pct}%` : '—'}</div>
     </aside></div>
   </main>;
 }

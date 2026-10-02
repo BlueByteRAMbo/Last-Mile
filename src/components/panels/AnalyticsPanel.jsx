@@ -17,15 +17,15 @@ const AnalyticsPanel = ({ kpis }) => {
     time: new Date(point.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }));
 
   return (
-    <div className="absolute top-40 left-6 z-10 pointer-events-auto bg-route-panel/95 backdrop-blur-md rounded-lg border border-white/10 shadow-2xl w-[420px] max-h-[65vh] overflow-y-auto p-4">
+    <div className="absolute top-56 md:top-40 left-3 md:left-6 max-w-[calc(100vw-1.5rem)] z-10 pointer-events-auto bg-route-panel/95 backdrop-blur-md rounded-lg border border-white/10 shadow-2xl w-[420px] max-h-[65vh] overflow-y-auto p-4">
       <h2 className="text-sm font-bold text-white mb-3">Performance Analytics</h2>
       <DispatchComparison />
 
       <div className="grid grid-cols-3 gap-2 mb-4">
-        <StatCard label="AVG DELIVERY" value={`${kpis.avg_delivery_minutes}m`} />
-        <StatCard label="ON-TIME RATE" value={`${kpis.on_time_rate_pct}%`} accent="text-route-green" />
+        <StatCard label="AVG DELIVERY" value={kpis.avg_delivery_minutes != null ? `${kpis.avg_delivery_minutes}m` : '—'} />
+        <StatCard label="ON-TIME RATE" value={kpis.on_time_rate_pct != null ? `${kpis.on_time_rate_pct}%` : '—'} accent="text-route-green" />
         <StatCard label="RIDER UTIL" value={`${kpis.rider_utilization_pct}%`} accent="text-route-cyan" />
-        <StatCard label="SLA BREACH" value={`${kpis.sla_breach_rate_pct}%`} accent={kpis.sla_breach_rate_pct > 10 ? 'text-route-red' : 'text-white'} />
+        <StatCard label="SLA BREACH" value={kpis.sla_breach_rate_pct != null ? `${kpis.sla_breach_rate_pct}%` : '—'} accent={kpis.sla_breach_rate_pct > 10 ? 'text-route-red' : 'text-white'} />
         <StatCard label="DELIVERED" value={kpis.delivered_count} />
         <StatCard label="FAILED/CANCELLED" value={kpis.failed_count} accent={kpis.failed_count > 0 ? 'text-route-amber' : 'text-white'} />
         <StatCard label="OVERDUE NOW" value={kpis.delayed_count ?? 0} accent="text-route-red" />
