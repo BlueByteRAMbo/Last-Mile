@@ -182,7 +182,7 @@ async def test_customer_tracking_broadcast_contains_delivery_and_no_internal_sco
 
 
 async def test_checkout_validates_quantity_and_uses_catalog_weight(client):
-    body = {'customer_lat': 19.1, 'customer_lng': 72.8,
+    body = {'customer_lat': 19.1, 'customer_lng': 72.85,
             'items': [{'sku': 'SKU-MILK', 'name': 'Spoofed', 'qty': 0, 'weight_kg': .01}]}
     assert (await client.post('/orders', json=body)).status_code == 422
     body['items'][0]['qty'] = 1
@@ -262,7 +262,7 @@ async def client(monkeypatch):
 
     async with main_module.app.router.lifespan_context(main_module.app):
         transport = ASGITransport(app=main_module.app)
-        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        async with AsyncClient(transport=transport, base_url="http://test", headers={"X-Ops-Request": "1"}) as ac:
             ac.session_factory = SessionLocal  # smuggle it through for tests that need raw DB access
             yield ac
     await engine.dispose()

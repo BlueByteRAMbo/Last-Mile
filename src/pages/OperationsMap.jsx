@@ -1,4 +1,5 @@
-import React, { useState, Suspense, lazy } from 'react';
+import React, { useState, useEffect, Suspense, lazy } from 'react';
+import { api } from '../api';
 import RouteMap from '../components/RouteMap';
 import TopNavigation from '../components/TopNavigation';
 import KPIBar from '../components/KPIBar';
@@ -30,6 +31,18 @@ const OperationsMap = () => {
   const [activeTab, setActiveTab] = useState('Overview');
 
   const live = useLiveOps();
+  const [riderDetail, setRiderDetail] = useState(null);
+  const selectedRiderId = selectedEntity?.type === 'RIDER' ? selectedEntity.id : null;
+
+  useEffect(() => {
+    setRiderDetail(null);
+    if (!selectedRiderId) return;
+    let stop = false;
+    const load = () => api.riderDetail(selectedRiderId).then(d => { if (!stop && d.id) setRiderDetail(d); }).catch(() => {});
+    load();
+    const t = setInterval(load, 2000);
+    return () => { stop = true; clearInterval(t); };
+  }, [selectedRiderId]);
 
   const handleEntitySelect = (entity) => {
     setSelectedEntity(entity);
@@ -69,6 +82,7 @@ const OperationsMap = () => {
         riders={live.riders}
         orders={live.orders}
         trafficZones={live.trafficZones}
+        riderDetail={riderDetail}
         demandZones={live.kpis?.zone_density || []}
         showDemandHeatmap={activeTab === 'Analytics'}
       />
@@ -87,6 +101,7 @@ const OperationsMap = () => {
         <>
           <EntityPanel
             entity={selectedEntity}
+            riderDetail={riderDetail}
             onClose={() => setSelectedEntity(null)}
           />
 

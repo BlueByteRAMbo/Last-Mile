@@ -17,12 +17,13 @@ import uuid
 from . import world as world_module
 from .world import world, NON_TERMINAL_STATUSES, ACTIVE_STATUSES
 from .catalog import CATALOG
+from .geo import is_on_land
 from .dispatch import (
     allocate_sync, cheapest_insertion_cost, rolling_reoptimize_sync,
     traffic_multiplier_for_leg, active_traffic_zones, haversine_km,
 )
 from . import routing
-from .tracking import rider_route, delivery_etas, order_tracking
+from .tracking import rider_route, delivery_etas, order_tracking, aware
 from .tracking import stock_check
 from .ws import manager
 
@@ -73,7 +74,12 @@ def spawn_order():
     if not world.stores:
         return
     anchor = _rng.choice(world.stores)
-    lat, lng = _jitter_point(anchor.lat, anchor.lng, km=4.0)
+    lat, lng = anchor.lat, anchor.lng
+    for _ in range(30):  # coastal stores: reject points that fall in the sea / creek
+        cand = _jitter_point(anchor.lat, anchor.lng, km=4.0)
+        if is_on_land(*cand):
+            lat, lng = cand
+            break
     n_items = _rng.randint(1, 3)
     items = []
     weight = 0.0
@@ -105,11 +111,16 @@ def try_allocate(order, active_orders):
     active_by_rider = _group_by(active_orders, ACTIVE_STATUSES, "rider_id")
     decision = allocate_sync(order, world.stores, world.riders, active_by_rider, world.inventory, state["dispatch_mode"])
     if decision["chosen"] is None:
-        order.risk = "AT_RISK"
-        order.assignment_reason = json.dumps(decision, default=str)  # keeps the split-fulfilment suggestion visible via /explain
-        world.mark_order_dirty(order.id)
-        world.log_event(order.id, "DELAY_RISK", {"reason": "no_feasible_store_or_rider"})
+        # Record the miss once per order, not every tick: re-logging and re-dirtying a stuck order
+        # each 2s tick produced hundreds of duplicate events and DB writes per order. Risk is left to
+        # recompute_risk (slack-based); setting it here just flapped against it every tick.
+        if not getattr(order, "_unallocated_logged", False):
+            order._unallocated_logged = True
+            order.assignment_reason = json.dumps(decision, default=str)  # keeps the split-fulfilment suggestion visible via /explain
+            world.mark_order_dirty(order.id)
+            world.log_event(order.id, "DELAY_RISK", {"reason": "no_feasible_store_or_rider"})
         return
+    order._unallocated_logged = False
     chosen = decision["chosen"]
     store_id, rider_id = chosen["store_id"], chosen["rider_id"]
 
@@ -161,6 +172,9 @@ def advance_packing(active_orders, speed_mult=1):
 
 
 BATTERY_DRAIN_PCT_PER_KM = 0.4
+RECHARGE_PCT_PER_SEC = 0.05  # idle riders swap/charge: ~0% -> 100% in about 33 simulated minutes
+SHIFT_LENGTH = dt.timedelta(hours=8)
+SHIFT_ROLL_THRESHOLD = dt.timedelta(hours=1)
 
 # legs discovered this tick that need a real route fetched — tick_sync() is pure sync so it can't
 # await routing.ensure_route() itself; it appends here and the async tick() wrapper fires them as
@@ -187,16 +201,31 @@ def move_riders(active_orders):
     for rider in world.riders:
         if rider.status == "OFFLINE":
             continue
+        # rolling shift: without this every rider became ineligible 8h (wall clock) after seeding
+        shift_end = aware(rider.shift_end) if rider.shift_end else None
+        if shift_end is None or shift_end < now + SHIFT_ROLL_THRESHOLD:
+            rider.shift_end = now + SHIFT_LENGTH
+            world.mark_rider_dirty(rider.id)
         active = sorted(by_rider.get(rider.id, []), key=lambda o: o.route_seq or 0)
         if not active:
             if rider.status in ("ON_DELIVERY", "PICKING_UP"):
                 rider.status = "AVAILABLE"
                 rider.nav_target_lat = rider.nav_target_lng = None
                 world.mark_rider_dirty(rider.id)
+            if rider.battery_pct < 100:  # idle riders recharge; otherwise the fleet only ever drains
+                rider.battery_pct = min(100.0, rider.battery_pct + RECHARGE_PCT_PER_SEC * TICK_SECONDS * speed_mult)
+                world.mark_rider_dirty(rider.id)
             continue
 
         awaiting_pickup = [o for o in active if o.status == "packed"]
         target_order = awaiting_pickup[0] if awaiting_pickup else active[0]
+        # commit to a delivery leg already under way: a newly packed order must not yank the rider
+        # off the road to the customer mid-trip; it gets picked up after this drop-off.
+        if rider.nav_target_lat is not None:
+            committed = next((o for o in active if o.status == "out_for_delivery"
+                              and (o.customer_lat, o.customer_lng) == (rider.nav_target_lat, rider.nav_target_lng)), None)
+            if committed:
+                target_order = committed
         heading_to_store = target_order.status == "packed"
         if heading_to_store:
             store = world.store_by_id[target_order.store_id]
@@ -211,6 +240,13 @@ def move_riders(active_orders):
             rider.nav_target_lat, rider.nav_target_lng = dest_lat, dest_lng
             rider.route_progress_km = 0.0
             _pending_route_fetches.append((rider.nav_origin_lat, rider.nav_origin_lng, dest_lat, dest_lng))
+
+        # a leg can be mid-flight with no cached road route (rider restored from the DB, cache eviction,
+        # failed fetch) — keep asking; ensure_route dedupes in-flight/cached keys. ponytail: retries every
+        # tick while Mapbox is failing, add backoff if that ever costs real quota.
+        leg = (rider.nav_origin_lat, rider.nav_origin_lng, dest_lat, dest_lng)
+        if routing.get_cached_route(*leg) is None and leg not in _pending_route_fetches:
+            _pending_route_fetches.append(leg)
 
         polyline, total_km = _leg_polyline_and_length(rider)
         # speed_mult compresses simulated time: at 10x, each tick covers 10x the distance
@@ -242,6 +278,7 @@ def move_riders(active_orders):
                 target_order.status = "delivered"
                 target_order.delivered_at = now
                 rider.current_load_kg = max(0.0, rider.current_load_kg - target_order.weight_kg)
+                world.consume_stock(target_order.store_id, target_order.items)
                 world.mark_order_dirty(target_order.id)
                 world.log_event(target_order.id, "DELIVERED")
             rider.nav_target_lat = rider.nav_target_lng = None  # force a fresh leg next tick

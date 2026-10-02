@@ -2,6 +2,7 @@ import datetime as dt
 import random
 from .models import DarkStore, InventoryItem, Rider
 from .catalog import CATALOG
+from .geo import is_on_land
 
 STORES = [
     ("DS-1", "Andheri Hub", 19.1136, 72.8697),
@@ -31,9 +32,12 @@ def build_seed_entities():
     riders = []
     for i in range(1, 16):
         store = stores[(i - 1) % len(stores)]
+        lat, lng = store.lat + (i % 3 - 1) * 0.01, store.lng + (i % 3 - 1) * 0.01
+        if not is_on_land(lat, lng):
+            lat, lng = store.lat, store.lng
         riders.append(Rider(
             id=f"RX-{100 + i}", name=f"Rider {100 + i}",
-            lat=store.lat + (i % 3 - 1) * 0.01, lng=store.lng + (i % 3 - 1) * 0.01,
+            lat=lat, lng=lng,
             home_store_id=store.id, capacity_kg=15.0, current_load_kg=0.0,
             speed_kmh=26.0 + (i % 5), battery_pct=100, status="AVAILABLE",
             shift_end=now + dt.timedelta(hours=8),

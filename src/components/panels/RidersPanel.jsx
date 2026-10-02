@@ -21,11 +21,19 @@ const RidersPanel = ({ riders, onSelect }) => (
           </div>
           <div className="flex items-center gap-2">
             <span className={`text-[10px] font-semibold ${statusColor(r.status)}`}>{r.status.replace('_', ' ')}</span>
-            {r.status !== 'OFFLINE' && (
+            {r.status !== 'OFFLINE' ? (
               <button
+                aria-label={`Take ${r.name} offline`}
                 onClick={(e) => { e.stopPropagation(); api.disrupt('rider_offline', r.id); }}
-                className="opacity-0 group-hover:opacity-100 text-[9px] text-route-red border border-route-red/40 rounded px-1.5 py-0.5 hover:bg-route-red/10 transition-opacity">
+                className="opacity-0 group-hover:opacity-100 focus:opacity-100 text-[9px] text-route-red border border-route-red/40 rounded px-1.5 py-0.5 hover:bg-route-red/10 transition-opacity">
                 drop
+              </button>
+            ) : (
+              <button
+                aria-label={`Bring ${r.name} back online`}
+                onClick={(e) => { e.stopPropagation(); api.disrupt('rider_online', r.id); }}
+                className="text-[9px] text-route-green border border-route-green/40 rounded px-1.5 py-0.5 hover:bg-route-green/10">
+                restore
               </button>
             )}
           </div>

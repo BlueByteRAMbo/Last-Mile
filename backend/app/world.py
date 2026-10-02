@@ -27,8 +27,10 @@ ORDER_MUTABLE_COLUMNS = ["status", "risk", "priority", "store_id", "rider_id", "
                           "assignment_reason", "failed_reason", "stock_check"]
 RIDER_MUTABLE_COLUMNS = ["lat", "lng", "status", "current_load_kg", "battery_pct",
                           "busy_seconds", "observed_shift_seconds",
-                          "nav_origin_lat", "nav_origin_lng", "nav_target_lat", "nav_target_lng", "route_progress_km"]
+                          "nav_origin_lat", "nav_origin_lng", "nav_target_lat", "nav_target_lng", "route_progress_km",
+                          "shift_end"]
 INVENTORY_MUTABLE_COLUMNS = ["qty", "reserved_qty"]
+MAX_EVENTS_IN_MEMORY = 20000
 
 
 class World:
@@ -54,6 +56,8 @@ class World:
         event = OrderEvent(order_id=order_id, type=type_, payload=payload or {}, ts=dt.datetime.now(dt.timezone.utc))
         self.pending_events.append(event)
         self.events.append(event)
+        if len(self.events) > MAX_EVENTS_IN_MEMORY:  # full history stays in the DB; memory (and every scan of it) stays bounded
+            del self.events[:MAX_EVENTS_IN_MEMORY // 5]
 
     def mark_order_dirty(self, order_id: str):
         self.dirty_order_ids.add(order_id)
@@ -79,6 +83,17 @@ class World:
                 row.reserved_qty += it["qty"]
                 self.mark_inventory_dirty(key)
 
+    def consume_stock(self, store_id: str, items: list):
+        """Delivered: the goods physically leave the shelf. Drops on-hand qty and the matching reservation
+        together, so 'available' (qty - reserved) is unchanged by the delivery itself and stops leaking."""
+        for it in items:
+            key = (store_id, it["sku"])
+            row = self.inventory.get(key)
+            if row:
+                row.qty = max(0, row.qty - it["qty"])
+                row.reserved_qty = max(0, row.reserved_qty - it["qty"])
+                self.mark_inventory_dirty(key)
+
     def release_stock(self, store_id: str, items: list):
         for it in items:
             key = (store_id, it["sku"])
@@ -88,12 +103,15 @@ class World:
                 self.mark_inventory_dirty(key)
 
     def reassign_rider_orders(self, rider_id: str) -> list[str]:
-        """Rider just went offline: free their pre-pickup orders so the next tick reallocates them."""
+        """Rider just went offline: free every unfinished order they hold — including ones already picked
+        up — so the next tick reallocates them. (Leaving picked-up orders with an offline rider stranded
+        them forever: the rider never moves again and nothing else touches those orders.)"""
         rider = self.rider_by_id.get(rider_id)
         freed = []
         for o in self.orders.values():
-            if o.rider_id != rider_id or o.status not in ("assigned", "packing", "packed"):
+            if o.rider_id != rider_id or o.status not in ("assigned", "packing", "packed", "out_for_delivery"):
                 continue
+            o.picked_up_at = None
             if o.store_id:
                 self.release_stock(o.store_id, o.items)
             if rider:
@@ -219,8 +237,18 @@ async def persist_once(session: AsyncSession | None = None):
                 await s.execute(sa_update(InventoryItem), inv_rows)
             await s.commit()
 
-        if session is not None:
-            await _run(session)
-        else:
-            async with SessionLocal() as s:
-                await _run(s)
+        try:
+            if session is not None:
+                await _run(session)
+            else:
+                async with SessionLocal() as s:
+                    await _run(s)
+        except Exception:
+            # The write is one transaction, so nothing was saved. Put the snapshot back so the next
+            # flush retries it instead of silently losing these updates and events.
+            world.dirty_order_ids |= order_ids
+            world.dirty_rider_ids |= rider_ids
+            world.dirty_inventory_keys |= inv_keys
+            world.pending_events = events + world.pending_events
+            world.pending_new_orders = new_orders + world.pending_new_orders
+            raise

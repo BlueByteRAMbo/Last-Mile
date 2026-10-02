@@ -5,7 +5,7 @@ import SpeedSelector from './SpeedSelector';
 
 const TopNavigation = ({ liveOperations, setLiveOperations, activeTab, onTabChange }) => {
   return (
-    <div className="absolute top-0 left-0 w-full z-10 flex items-center justify-between p-4 px-6 pointer-events-none">
+    <div className="absolute top-0 left-0 w-full z-40 flex items-center justify-between p-4 px-6 pointer-events-none">
       
       {/* Brand */}
       <div className="flex flex-col pointer-events-auto bg-route-base/80 backdrop-blur-md p-3 rounded-lg border border-white/5 shadow-lg">

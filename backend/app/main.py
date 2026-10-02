@@ -4,7 +4,8 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 from typing import Literal
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+import os
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func
@@ -54,7 +55,23 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Last Mile Mission Control", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# Only the app's own front-end origins may call the API from a browser (override with CORS_ORIGINS).
+CORS_ORIGINS = [o.strip() for o in os.environ.get(
+    "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if o.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"])
+
+OPS_TOKEN = os.environ.get("OPS_TOKEN")
+
+
+async def require_ops(x_ops_request: str | None = Header(default=None), x_ops_token: str | None = Header(default=None)):
+    """Guards state-changing operator endpoints (reset, disruptions, restock, interventions, sim controls).
+    A custom header cannot be sent cross-site without a CORS preflight, which the origin allow-list above
+    refuses, so a random web page can no longer fire these at a local server. Set OPS_TOKEN to also
+    require a shared secret (sent as X-Ops-Token) when the API is exposed beyond localhost."""
+    if x_ops_request is None:
+        raise HTTPException(403, "Operator endpoint: missing X-Ops-Request header")
+    if OPS_TOKEN and x_ops_token != OPS_TOKEN:
+        raise HTTPException(403, "Operator endpoint: invalid token")
 
 
 class DispatchMode(BaseModel):
@@ -66,7 +83,7 @@ async def dispatch_mode():
     return {'mode': simulator.state['dispatch_mode']}
 
 
-@app.post('/dispatch/mode')
+@app.post('/dispatch/mode', dependencies=[Depends(require_ops)])
 async def set_dispatch_mode(body: DispatchMode):
     simulator.state['dispatch_mode'] = body.mode
     return {'mode': body.mode}
@@ -81,7 +98,7 @@ async def get_sim_speed():
     return {'multiplier': simulator.state['tick_speed_multiplier']}
 
 
-@app.post('/simulation/speed')
+@app.post('/simulation/speed', dependencies=[Depends(require_ops)])
 async def set_sim_speed(body: SimSpeedBody):
     simulator.state['tick_speed_multiplier'] = body.multiplier
     return {'multiplier': body.multiplier}
@@ -219,7 +236,7 @@ class RestockBody(BaseModel):
     qty: int = Field(gt=0, le=500)
 
 
-@app.post("/dark_stores/{store_id}/restock")
+@app.post("/dark_stores/{store_id}/restock", dependencies=[Depends(require_ops)])
 async def restock_store(store_id: str, body: RestockBody):
     key = (store_id, body.sku)
     row = world.inventory.get(key)
@@ -258,7 +275,7 @@ async def list_orders(status: str | None = None):
     } for o in orders[:200]]
 
 
-@app.post("/orders/{order_id}/intervene/{action}")
+@app.post("/orders/{order_id}/intervene/{action}", dependencies=[Depends(require_ops)])
 async def intervene_order(order_id: str, action: str):
     order = world.orders.get(order_id)
     if order is None:
@@ -342,6 +359,9 @@ class OrderCreate(BaseModel):
 async def create_order(body: OrderCreate):
     """Customer-facing order placement. Written straight into world state so the very next tick
     can allocate it — no DB round trip on the request path."""
+    from .geo import is_on_land
+    if not is_on_land(body.customer_lat, body.customer_lng):
+        raise HTTPException(422, "That delivery location is in the water or outside our service area. Please pick a spot on land.")
     items = [it.model_dump() for it in body.items]
     for item in items:
         product = CATALOG_BY_SKU.get(item['sku'])
@@ -403,6 +423,63 @@ async def rider_route(rider_id: str):
             "deadline_slack_seconds": round(deadline_slack, 1),
         })
     return {"rider_id": rider_id, "route_version": len(active), "stops": stops}
+
+
+@app.get("/riders/{rider_id}/detail")
+async def rider_detail(rider_id: str):
+    """Everything the ops map needs to explain one rider: current leg (from -> to), the road polyline
+    being followed, and each order on board / waiting with its pickup store and drop-off."""
+    rider = world.rider_by_id.get(rider_id)
+    if rider is None:
+        raise HTTPException(404, "rider not found")
+    mine = sorted([o for o in world.orders.values() if o.rider_id == rider_id and o.status in
+                   ("assigned", "packing", "packed", "out_for_delivery")], key=lambda o: o.route_seq or 0)
+
+    def stop(order, kind):
+        if kind == "store":
+            s = world.store_by_id[order.store_id]
+            return {"kind": "store", "label": s.name, "lat": s.lat, "lng": s.lng, "order_id": order.id}
+        return {"kind": "customer", "label": f"{order.customer_name} · {order.address_label}".strip(" ·"),
+                "lat": order.customer_lat, "lng": order.customer_lng, "order_id": order.id}
+
+    route = tracking_rider_route(rider)
+    # same target choice as simulator.move_riders: a packed order waiting at its store first, else the
+    # next drop-off. Derived from orders (not nav_target) so there is no "idle" blip on the tick a
+    # pickup clears the navigation state.
+    leg_to = leg_from = None
+    phase = "idle"
+    waiting = next((o for o in mine if o.status == "packed" and o.store_id), None)
+    onboard = next((o for o in mine if o.status == "out_for_delivery"), None)
+    committed = next((o for o in mine if o.status == "out_for_delivery" and rider.nav_target_lat is not None
+                      and (o.customer_lat, o.customer_lng) == (rider.nav_target_lat, rider.nav_target_lng)), None)
+    if committed:  # mid-delivery leg wins over a newly packed order, mirroring simulator.move_riders
+        onboard, waiting = committed, None
+    if waiting:
+        phase, leg_to = "to_store", stop(waiting, "store")
+        leg_from = {"kind": "point", "label": "Leg start (rider's last position)",
+                    "lat": rider.nav_origin_lat if rider.nav_origin_lat is not None else rider.lat,
+                    "lng": rider.nav_origin_lng if rider.nav_origin_lng is not None else rider.lng}
+    elif onboard:
+        phase, leg_to = "to_customer", stop(onboard, "customer")
+        leg_from = stop(onboard, "store") if onboard.store_id else None
+    eta = round(route["distance_remaining_km"] / rider.speed_kmh * 3600) if rider.speed_kmh else None
+    return {
+        "id": rider.id, "name": rider.name, "status": rider.status, "lat": rider.lat, "lng": rider.lng,
+        "speed_kmh": rider.speed_kmh, "battery_pct": round(rider.battery_pct, 1),
+        "current_load_kg": rider.current_load_kg, "capacity_kg": rider.capacity_kg,
+        "utilization": round(100 * rider.current_load_kg / rider.capacity_kg) if rider.capacity_kg else 0,
+        "phase": phase, "leg_from": leg_from, "leg_to": leg_to, "leg_eta_seconds": eta,
+        "polyline": route["polyline"], "polyline_remaining": route["polyline_remaining"],
+        "distance_remaining_km": route["distance_remaining_km"],
+        "orders": [{
+            "id": o.id, "status": o.status, "risk": o.risk, "customer_name": o.customer_name,
+            "address_label": o.address_label, "promised_at": o.promised_at.isoformat(),
+            "store": {"id": o.store_id, "name": world.store_by_id[o.store_id].name} if o.store_id else None,
+            "picked_up_at": o.picked_up_at.isoformat() if o.picked_up_at else None,
+            "items": o.items, "weight_kg": o.weight_kg,
+            "dropoff": {"lat": o.customer_lat, "lng": o.customer_lng},
+        } for o in mine],
+    }
 
 
 @app.get("/orders/{order_id}/explain")
@@ -496,7 +573,7 @@ async def evaluate_reroute(rider, zone) -> dict:
     return {"switched": False, **details, "reason": "kept current route — gain below threshold"}
 
 
-@app.post("/disruptions/{kind}")
+@app.post("/disruptions/{kind}", dependencies=[Depends(require_ops)])
 async def trigger_disruption(
     kind: str, target: str | None = None,
     lat: float | None = None, lng: float | None = None,
@@ -552,20 +629,23 @@ async def trigger_disruption(
         rider = world.rider_by_id.get(target)
         if rider:
             rider.status = "OFFLINE"
+            rider.nav_target_lat = rider.nav_target_lng = None
             world.mark_rider_dirty(target)
             freed = world.reassign_rider_orders(target)
             for oid in freed:
                 world.log_event(oid, "RIDER_OFFLINE", {"rider_id": target})
+    elif kind == "rider_online" and target:
+        rider = world.rider_by_id.get(target)
+        if rider and rider.status == "OFFLINE":
+            rider.status = "AVAILABLE"
+            world.mark_rider_dirty(target)
     elif kind == "stockout" and target:
-        for (sid, _sku), row in world.inventory.items():
-            if sid == target:
-                row.qty = row.reserved_qty
-                world.mark_inventory_dirty((sid, row.sku))
-        # pre-pickup orders already assigned to this store can't actually be packed anymore —
-        # bounce them back to the pool so the next tick reallocates them to a store that still
-        # has stock, instead of leaving them stuck waiting on a store that will never pack them
+        # Bounce pre-pickup orders back to the pool FIRST, releasing their reservations, so the next tick
+        # reallocates them to a store that still has stock. (Doing it after zeroing stock left those
+        # reservations behind forever.) Packed / on-the-road orders keep theirs: the goods already exist.
         for o in world.orders.values():
             if o.store_id == target and o.status in ("assigned", "packing"):
+                world.release_stock(target, o.items)
                 if o.rider_id:
                     rider = world.rider_by_id.get(o.rider_id)
                     if rider:
@@ -574,6 +654,10 @@ async def trigger_disruption(
                 o.status, o.store_id, o.rider_id, o.route_seq, o.assigned_at, o.packed_at = "created", None, None, None, None, None
                 world.mark_order_dirty(o.id)
                 world.log_event(o.id, "STOCK_OUT_REALLOCATE", {"store_id": target})
+        for (sid, _sku), row in world.inventory.items():
+            if sid == target:
+                row.qty = row.reserved_qty  # only what's already committed to packed/on-road orders remains
+                world.mark_inventory_dirty((sid, row.sku))
     elif kind == "cancel" and target:
         order = world.orders.get(target)
         if order and world.cancel_order(order):
@@ -583,7 +667,7 @@ async def trigger_disruption(
     return {"ok": True, "kind": kind, "state": {"order_spawn_rate": simulator.state["order_spawn_rate"]}}
 
 
-@app.post("/reset")
+@app.post("/reset", dependencies=[Depends(require_ops)])
 async def reset():
     async with world_module.db_write_lock:  # hold through delete + reseed + reload so persist_loop can't interleave
         async with SessionLocal() as session:

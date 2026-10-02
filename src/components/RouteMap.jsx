@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import mapboxgl from 'mapbox-gl';
+import 'mapbox-gl/dist/mapbox-gl.css';
 
 // Mapbox Token
 mapboxgl.accessToken = import.meta.env.VITE_MAPBOX_TOKEN;
@@ -31,6 +32,9 @@ function riderStatusCfg(status) {
   return RIDER_STATUS[status] || RIDER_STATUS.OFFLINE;
 }
 
+// Tooltips are built with innerHTML, and names come from user-submitted orders: escape everything interpolated.
+const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
 // Build a rider DOM marker element with: dot + status badge + hover tooltip
 function buildRiderEl(rider, orders) {
   const cfg = riderStatusCfg(rider.status);
@@ -38,7 +42,8 @@ function buildRiderEl(rider, orders) {
 
   const wrap = document.createElement('div');
   wrap.className = 'rider-marker-wrap';
-  wrap.style.cssText = 'position:relative;display:flex;flex-direction:column;align-items:center;gap:2px;cursor:pointer;';
+  // no `position` here: this is the Mapbox marker root, which needs mapbox's position:absolute (it also anchors the tooltip)
+  wrap.style.cssText = 'display:flex;flex-direction:column;align-items:center;gap:2px;cursor:pointer;width:max-content;';
 
   // Status badge (floats above the dot)
   const badge = document.createElement('div');
@@ -61,6 +66,7 @@ function buildRiderEl(rider, orders) {
 
   // Hover tooltip
   const tip = document.createElement('div');
+  tip.dataset.riderTip = '1';
   tip.style.cssText = `
     display:none;position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);
     background:rgba(15,23,42,0.97);color:#e2e8f0;font-size:11px;
@@ -73,12 +79,12 @@ function buildRiderEl(rider, orders) {
   const orderLines = assignedOrders.length
     ? assignedOrders.map(o => {
         const stIcon = { created:'⏳', assigned:'📋', packing:'📦', packed:'✅', out_for_delivery:'🛵', delivered:'🏁' }[o.status] || '•';
-        return `<div style="margin-top:4px;color:#94a3b8;font-size:10px">${stIcon} ${o.customer_name || o.id} · <span style="color:${orderBg(o)}">${(o.status||'').replace('_',' ')}</span></div>`;
+        return `<div style="margin-top:4px;color:#94a3b8;font-size:10px">${stIcon} ${esc(o.customer_name || o.id)} · <span style="color:${orderBg(o)}">${esc((o.status||'').replace('_',' '))}</span></div>`;
       }).join('')
     : '<div style="color:#64748b;margin-top:2px;font-size:10px">No active orders</div>';
 
   tip.innerHTML = `
-    <div style="font-weight:700;color:#f1f5f9">${cfg.emoji} ${rider.name}</div>
+    <div style="font-weight:700;color:#f1f5f9">${cfg.emoji} ${esc(rider.name)}</div>
     <div style="color:${cfg.bg};font-size:10px;margin-top:1px">${cfg.label}</div>
     <div style="margin-top:4px;color:#94a3b8;font-size:10px">🔋 ${rider.battery_pct}% · Load ${rider.current_load_kg?.toFixed(1)}/${rider.capacity_kg}kg</div>
     ${orderLines}
@@ -93,7 +99,7 @@ function buildRiderEl(rider, orders) {
 
 // Real backend state drives every marker: dark stores, riders (from /riders + WS ticks) and
 // orders (with live risk/priority) replace the old static mock data + random-walk animation.
-const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [], demandZones = [], showDemandHeatmap = false, simulationMode, onMapLoad }) => {
+const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [], riderDetail = null, demandZones = [], showDemandHeatmap = false, simulationMode, onMapLoad }) => {
   const mapContainer = useRef(null);
   const map = useRef(null);
   const [mapReady, setMapReady] = useState(false);
@@ -140,6 +146,9 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
     if (!m) return;
     const update = () => {
       if (!m.isStyleLoaded()) return;
+      try { applyHeatmap(); } catch { /* style still settling; the style.load listener retries */ }
+    };
+    const applyHeatmap = () => {
       const data = { type: 'FeatureCollection', features: demandZones.filter(z => z.count > 0 && z.lng != null && z.lat != null).map(z => ({
         type: 'Feature', properties: { count: z.count }, geometry: { type: 'Point', coordinates: [z.lng, z.lat] },
       })) };
@@ -186,6 +195,42 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
       m.addLayer({ id: 'traffic-zones-line', type: 'line', source: 'traffic-zones', paint: { 'line-color': '#F87171', 'line-width': 1.5, 'line-opacity': 0.5 } });
     }
   }, [trafficZones, mapReady]);
+
+  // Selected rider's road route: full leg faint, remaining leg bright, plus from/to stop pins
+  const routeStopMarkers = useRef([]);
+  useEffect(() => {
+    const m = map.current;
+    if (!m || !mapReady) return;
+    const line = (coords) => ({ type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: coords } });
+    const fc = (features) => ({ type: 'FeatureCollection', features });
+    const full = riderDetail?.polyline?.length > 1 ? [line(riderDetail.polyline)] : [];
+    const rest = riderDetail?.polyline_remaining?.length > 1 ? [line(riderDetail.polyline_remaining)] : [];
+    try {
+      if (m.getSource('rider-route-full')) {
+        m.getSource('rider-route-full').setData(fc(full));
+        m.getSource('rider-route-rest').setData(fc(rest));
+      } else {
+        m.addSource('rider-route-full', { type: 'geojson', data: fc(full) });
+        m.addSource('rider-route-rest', { type: 'geojson', data: fc(rest) });
+        m.addLayer({ id: 'rider-route-full', type: 'line', source: 'rider-route-full', layout: { 'line-cap': 'round', 'line-join': 'round' }, paint: { 'line-color': '#94a3b8', 'line-width': 4, 'line-opacity': 0.45 } });
+        m.addLayer({ id: 'rider-route-rest', type: 'line', source: 'rider-route-rest', layout: { 'line-cap': 'round', 'line-join': 'round' }, paint: { 'line-color': '#38bdf8', 'line-width': 5, 'line-opacity': 0.95 } });
+      }
+    } catch { /* style still settling; next detail poll retries */ }
+
+    routeStopMarkers.current.forEach(mk => mk.remove());
+    routeStopMarkers.current = [];
+    if (!riderDetail) return;
+    const pin = (stop, color, text) => {
+      if (!stop) return;
+      const el = document.createElement('div');
+      el.style.cssText = `background:${color};color:#000;font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px;border:2px solid #fff;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.5);pointer-events:none;`;
+      el.textContent = `${text}: ${stop.label}`;
+      routeStopMarkers.current.push(new mapboxgl.Marker({ element: el, anchor: 'bottom' }).setLngLat([stop.lng, stop.lat]).addTo(m));
+    };
+    pin(riderDetail.leg_from, '#fbbf24', 'FROM');
+    pin(riderDetail.leg_to, '#22c55e', 'TO');
+    return () => { routeStopMarkers.current.forEach(mk => mk.remove()); routeStopMarkers.current = []; };
+  }, [riderDetail, mapReady]);
 
   // Dark store markers
   useEffect(() => {
@@ -237,7 +282,7 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
           e.stopPropagation();
           const cur = ridersRef.current.find(r => r.id === rider.id) || rider;
           onEntitySelect({ type: 'RIDER', id: cur.id, name: cur.name, data: cur });
-          m.flyTo({ center: [cur.lng, cur.lat], zoom: 16.5, pitch: 65, speed: 1.2, curve: 1.42 });
+          m.flyTo({ center: [cur.lng, cur.lat], zoom: 14.5, pitch: 40, speed: 1.2, curve: 1.42 });
         });
         const marker = new mapboxgl.Marker(el).setLngLat([rider.lng, rider.lat]).addTo(m);
         entry = { marker, el, lastStatus: rider.status };
@@ -246,21 +291,14 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
         entry.marker.setLngLat([rider.lng, rider.lat]);
         if (needRebuild) {
           // Swap out the inner content when status changes
-          const newEl = buildRiderEl(rider, ordersRef.current);
-          newEl.addEventListener('click', (e) => {
-            e.stopPropagation();
-            const cur = ridersRef.current.find(r => r.id === rider.id) || rider;
-            onEntitySelect({ type: 'RIDER', id: cur.id, name: cur.name, data: cur });
-            m.flyTo({ center: [cur.lng, cur.lat], zoom: 16.5, pitch: 65, speed: 1.2, curve: 1.42 });
-          });
-          entry.marker.getElement().replaceWith(newEl);
-          entry.el = newEl;
+          // Keep the original root element: mapbox positions it via .mapboxgl-marker + transform,
+          // so replacing the root left the new one unpositioned and stretched across the map.
+          // The root already has the click handler, so only the inner content is swapped.
+          entry.el.replaceChildren(buildRiderEl(rider, ordersRef.current));
           entry.lastStatus = rider.status;
-          // mapbox-gl Marker still holds the old element reference; update it
-          entry.marker._element = newEl;
         } else {
           // Just refresh tooltip order list inside existing element
-          const tip = entry.el.querySelector('div[style*="position:absolute"]');
+          const tip = entry.el.querySelector('[data-rider-tip]');
           if (tip) {
             const cur = ridersRef.current.find(r => r.id === rider.id) || rider;
             const cfg = riderStatusCfg(cur.status);
@@ -268,11 +306,11 @@ const RouteMap = ({ onEntitySelect, darkStores, riders, orders, trafficZones = [
             const orderLines = assignedOrders.length
               ? assignedOrders.map(o => {
                   const stIcon = { created:'⏳', assigned:'📋', packing:'📦', packed:'✅', out_for_delivery:'🛵', delivered:'🏁' }[o.status] || '•';
-                  return `<div style="margin-top:4px;color:#94a3b8;font-size:10px">${stIcon} ${o.customer_name || o.id} · <span style="color:${orderBg(o)}">${(o.status||'').replace('_',' ')}</span></div>`;
+                  return `<div style="margin-top:4px;color:#94a3b8;font-size:10px">${stIcon} ${esc(o.customer_name || o.id)} · <span style="color:${orderBg(o)}">${esc((o.status||'').replace('_',' '))}</span></div>`;
                 }).join('')
               : '<div style="color:#64748b;margin-top:2px;font-size:10px">No active orders</div>';
             tip.innerHTML = `
-              <div style="font-weight:700;color:#f1f5f9">${cfg.emoji} ${cur.name}</div>
+              <div style="font-weight:700;color:#f1f5f9">${cfg.emoji} ${esc(cur.name)}</div>
               <div style="color:${cfg.bg};font-size:10px;margin-top:1px">${cfg.label}</div>
               <div style="margin-top:4px;color:#94a3b8;font-size:10px">🔋 ${cur.battery_pct}% · Load ${cur.current_load_kg?.toFixed(1)}/${cur.capacity_kg}kg</div>
               ${orderLines}
